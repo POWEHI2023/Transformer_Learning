@@ -18,7 +18,7 @@ class RoPE(torch.nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Any:
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         # [B, H, L, head_dim]/ [L]
         # [L, 1] * [1, head_dim / 2] -> [L, head_dim / 2]
         angles = position_ids.to(self.inv_freq.dtype).unsqueeze(-1) * self.inv_freq.unsqueeze(0)
@@ -62,7 +62,12 @@ class Attention(torch.nn.Module):
         self.rope = RoPE(head_dim=self.head_dim, base=rope_base)
     
     # X  shape: [B, L, d_model]
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        position_ids: torch.Tensor, 
+        attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         batch_size, sequence_length, _ = x.shape
         # [B, L, 3 * d_model]
         x = self.input_proj(x)
@@ -83,6 +88,8 @@ class Attention(torch.nn.Module):
         # S = QK / sqrt(n)
         s = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
 
+        blocked_mask = None
+
         if self.use_causal_mask:
             q_len = q.size(-2)
             k_len = k.size(-2)
@@ -90,7 +97,22 @@ class Attention(torch.nn.Module):
                 torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
                 diagonal=1,
             )
-            s = s.masked_fill(causal_mask, float("-inf"))
+            # s = s.masked_fill(causal_mask, float("-inf"))
+            blocked_mask = causal_mask
+
+        # Use attention mask
+        if attention_mask is not None:
+            assert attention_mask.shape == (batch_size, sequence_length)
+            # [B, L] -> [B, 1, 1, L]
+            padding_blocked = ~attention_mask.to(device=q.device, dtype=torch.bool)[:, None, None, :]
+            blocked_mask = (
+                padding_blocked
+                if blocked_mask is None
+                else blocked_mask | padding_blocked
+            )
+
+        if blocked_mask is not None:
+            s = s.masked_fill(blocked_mask, float("-inf"))
 
         # O = (QK / sqrt(n)) @ V
         o = torch.softmax(s, dim=-1) @ v
@@ -138,10 +160,15 @@ class TransformerBlock(torch.nn.Module):
             torch.nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        position_ids: torch.Tensor, 
+        attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # in: [B, L, d_model], out: [B, L, d_model]
         y = self.attn_norm(x)
-        y = self.attn(y, position_ids)
+        y = self.attn(y, position_ids, attention_mask)
         y = self.attn_dropout(y)
         x = x + y
 
@@ -158,13 +185,19 @@ class Transformer(torch.nn.Module):
         dropout: float = 0.0,
         use_causal_mask: bool = True,
         tie_embedding: bool = True,
+        pad_token_id: int | None = None,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0
         self.head_dim = d_model // n_heads
         assert self.head_dim % 2 == 0
 
-        self.token_embedding = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+        self.pad_token_id = pad_token_id
+        self.token_embedding = torch.nn.Embedding(
+            num_embeddings=vocab_size, 
+            embedding_dim=d_model, 
+            padding_idx=pad_token_id,
+        )
         self.embedding_dropout = torch.nn.Dropout(dropout)
 
         self.layers = torch.nn.ModuleList([
@@ -181,10 +214,10 @@ class Transformer(torch.nn.Module):
         # [B, L, d_model] -> [B, L, vocab_size]
         self.lm_head = torch.nn.Linear(d_model, vocab_size, bias=False)
         # share weight
-        if tie_embedding:
+        if tie_embedding and self.pad_token_id is None:
             self.lm_head.weight = self.token_embedding.weight
 
-    def forward(self, token_ids: torch.Tensor) -> Any:
+    def forward(self, token_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> Any:
         # [B, L]
         assert token_ids.dim() == 2 and token_ids.dtype == torch.long
         batch_size, sequence_length = token_ids.shape
@@ -192,11 +225,25 @@ class Transformer(torch.nn.Module):
         x = self.token_embedding(token_ids)
         x = self.embedding_dropout(x)
 
+        if attention_mask is None and self.pad_token_id is not None:
+            attention_mask = token_ids != self.pad_token_id
+
+        if attention_mask is not None:
+            assert token_ids.shape == attention_mask.shape
+            attention_mask = attention_mask.to(device=token_ids.device, dtype=torch.bool)
+            assert attention_mask.any(dim=-1).all(), "Every sample must contain at least one valid token"
+
+            padding_started = (~attention_mask).cummax(dim=-1).values
+            has_valid_after_padding = (padding_started & attention_mask).any(dim=-1)
+            assert not has_valid_after_padding.any().item(), \
+                "Only right padding is supported. Expected masks like [1, 1, 1, 0, 0]."
+
+
         # [B, L, d_model]
         for layer in self.layers:
             # Outer position ids
             position_ids = torch.arange(sequence_length, device=token_ids.device, dtype=torch.long)
-            x = layer(x, position_ids)
+            x = layer(x, position_ids, attention_mask)
 
         # [B, L, d_model]
         x = self.final_norm(x)
@@ -206,3 +253,6 @@ class Transformer(torch.nn.Module):
 
 # Padding Mask: 屏蔽为了对齐长度而补充的 PAD token。
 # Packed Sequence Mask: 防止拼接在同一序列中的不同样本互相关注, 为了避免浪费训练资源, 将多个短序列合并成一个长序列
+
+# 左侧 Padding: PAD token 放在有效 token 的左侧, 有时用于批量自回归生成, 所有样本最后一个位置都是最新的 token。
+# 右侧 Padding: PAD token 放在有效 token 的右侧, 右侧 Padding 是训练 Decoder-Only Transformer 时常见的方式, 有效 token 都位于序列开头, 不会出现有效 token 前面全是被屏蔽位置的情况。
