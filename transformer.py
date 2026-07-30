@@ -11,6 +11,7 @@ class RoPE(torch.nn.Module):
     ) -> None:
         super().__init__()
         assert head_dim % 2 == 0
+        # inv_freq_i = 1 / base ^ { 2i / head_dim }, [head_dim/2]
         inv_freq = 1.0 / (
             base ** (
                 torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim
@@ -19,12 +20,31 @@ class RoPE(torch.nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        # [B, H, L, head_dim]/ [L]
-        # [L, 1] * [1, head_dim / 2] -> [L, head_dim / 2]
-        angles = position_ids.to(self.inv_freq.dtype).unsqueeze(-1) * self.inv_freq.unsqueeze(0)
-        # [1, 1, L, head_dim/2]
-        cos = angles.cos().unsqueeze(0).unsqueeze(0)
-        sin = angles.sin().unsqueeze(0).unsqueeze(0)
+        # x: [B, H, L, head_dim]/ [L]
+        batch_size, _, sequence_length, _ = x.shape
+
+        if position_ids.ndim == 1:
+            # [L]
+            assert position_ids.shape == (sequence_length,), "1D position_ids must have shape [L]"
+            # [1, L]
+            position_ids = position_ids.unsqueeze(0)
+        elif position_ids.ndim == 2:
+            assert position_ids.shape in (
+                (1, sequence_length),
+                (batch_size, sequence_length),
+            ), "2D position_ids must have shape [1, L] or [B, L]"
+        else:
+            raise ValueError("position_ids must have shape [L] or [B, L]")
+        # [B, L]
+        position_ids = position_ids.to(device=x.device, dtype=self.inv_freq.dtype)
+
+        # position_ids:     [B or 1, L] -> [B or 1, L, 1]
+        # inv_freq:         [head_dim/2] -> [1, 1, head_dim/2]
+        # broadcast angles: [B or 1, L, head_dim/2]
+        angles = position_ids.unsqueeze(-1) * self.inv_freq.view(1, 1, -1)
+        # [B or 1, 1, L, head_dim/2]
+        cos = angles.cos().unsqueeze(1)
+        sin = angles.sin().unsqueeze(1)
 
         cos = cos.to(dtype=x.dtype)
         sin = sin.to(dtype=x.dtype)
@@ -36,6 +56,7 @@ class RoPE(torch.nn.Module):
         rotated_even = x_even * cos - x_odd * sin
         rotated_odd = x_even * sin + x_odd * cos
 
+        # [B, H, L, head_dim/2, 2]
         rotated = torch.stack((rotated_even, rotated_odd), dim=-1)
         # [B, H, L, head_dim]
         return rotated.flatten(-2)
@@ -217,7 +238,12 @@ class Transformer(torch.nn.Module):
         if tie_embedding and self.pad_token_id is None:
             self.lm_head.weight = self.token_embedding.weight
 
-    def forward(self, token_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> Any:
+    def forward(
+        self, 
+        token_ids: torch.Tensor, 
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> Any:
         # [B, L]
         assert token_ids.dim() == 2 and token_ids.dtype == torch.long
         batch_size, sequence_length = token_ids.shape
@@ -238,11 +264,12 @@ class Transformer(torch.nn.Module):
             assert not has_valid_after_padding.any().item(), \
                 "Only right padding is supported. Expected masks like [1, 1, 1, 0, 0]."
 
+        if position_ids is None:
+            position_ids = torch.arange(sequence_length, device=token_ids.device, dtype=torch.long)
 
         # [B, L, d_model]
         for layer in self.layers:
             # Outer position ids
-            position_ids = torch.arange(sequence_length, device=token_ids.device, dtype=torch.long)
             x = layer(x, position_ids, attention_mask)
 
         # [B, L, d_model]
@@ -252,7 +279,11 @@ class Transformer(torch.nn.Module):
 
 
 # Padding Mask: 屏蔽为了对齐长度而补充的 PAD token。
-# Packed Sequence Mask: 防止拼接在同一序列中的不同样本互相关注, 为了避免浪费训练资源, 将多个短序列合并成一个长序列
+# Packed Sequence Mask: 防止拼接在同一序列中的不同样本互相关注, 为了避免浪费训练资源, 将多个短序列合并成一个长序列, (未实现)
 
 # 左侧 Padding: PAD token 放在有效 token 的左侧, 有时用于批量自回归生成, 所有样本最后一个位置都是最新的 token。
 # 右侧 Padding: PAD token 放在有效 token 的右侧, 右侧 Padding 是训练 Decoder-Only Transformer 时常见的方式, 有效 token 都位于序列开头, 不会出现有效 token 前面全是被屏蔽位置的情况。
+
+# RoPE: 旋转位置编码, 
+
+# TODO Packed segment attention mask; Packed segment boundary loss mask
