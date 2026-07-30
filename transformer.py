@@ -1,0 +1,208 @@
+import torch
+import math
+from typing import Any
+import torch.nn.functional as F
+
+class RoPE(torch.nn.Module):
+    def __init__(
+        self,
+        head_dim: int,
+        base: float = 10_000.0,
+    ) -> None:
+        super().__init__()
+        assert head_dim % 2 == 0
+        inv_freq = 1.0 / (
+            base ** (
+                torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Any:
+        # [B, H, L, head_dim]/ [L]
+        # [L, 1] * [1, head_dim / 2] -> [L, head_dim / 2]
+        angles = position_ids.to(self.inv_freq.dtype).unsqueeze(-1) * self.inv_freq.unsqueeze(0)
+        # [1, 1, L, head_dim/2]
+        cos = angles.cos().unsqueeze(0).unsqueeze(0)
+        sin = angles.sin().unsqueeze(0).unsqueeze(0)
+
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+
+        # [B, H, L, head_dim/2]
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+
+        rotated_even = x_even * cos - x_odd * sin
+        rotated_odd = x_even * sin + x_odd * cos
+
+        rotated = torch.stack((rotated_even, rotated_odd), dim=-1)
+        # [B, H, L, head_dim]
+        return rotated.flatten(-2)
+
+class Attention(torch.nn.Module):
+    def __init__(
+        self,
+        n_heads: int,
+        d_model: int = 512,
+        use_causal_mask: bool = True,
+        rope_base: float = 10_000.0,
+    ) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.head_dim = self.d_model // self.n_heads
+        assert self.head_dim % 2 == 0
+        self.use_causal_mask = use_causal_mask
+
+        self.input_proj = torch.nn.Linear(self.d_model, 3 * self.d_model)
+        self.output_proj = torch.nn.Linear(self.d_model, self.d_model)
+
+        self.rope = RoPE(head_dim=self.head_dim, base=rope_base)
+    
+    # X  shape: [B, L, d_model]
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, _ = x.shape
+        # [B, L, 3 * d_model]
+        x = self.input_proj(x)
+        # split the last dimention into 3 partitions, [B, L, d_model]
+        q, k, v = x.chunk(3, dim=-1)
+
+        # [B, n_heads, L, head_dim]
+        q = q.view(batch_size, sequence_length, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, sequence_length, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, sequence_length, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # RoPE: position embedding
+        # position_ids = torch.arange(sequence_length, device=x.device)
+        q = self.rope(q, position_ids)
+        k = self.rope(k, position_ids)
+
+        # Standard Attention for each Head
+        # S = QK / sqrt(n)
+        s = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+
+        if self.use_causal_mask:
+            q_len = q.size(-2)
+            k_len = k.size(-2)
+            causal_mask = torch.triu(
+                torch.ones(q_len, k_len, device=q.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            s = s.masked_fill(causal_mask, float("-inf"))
+
+        # O = (QK / sqrt(n)) @ V
+        o = torch.softmax(s, dim=-1) @ v
+        # combine all heads
+        o = o.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
+
+        return self.output_proj(o)
+
+class SwiGLU(torch.nn.Module):
+    def __init__(self, d_model: int, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim or ((8 * self.d_model) // 3)
+
+        self.gate_proj = torch.nn.Linear(self.d_model, self.hidden_dim, bias=False)
+        self.a_up_proj = torch.nn.Linear(self.d_model, self.hidden_dim, bias=False)
+        self.a_down_proj = torch.nn.Linear(self.hidden_dim, self.d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, L, d_model] -> [B, L, hidden_dim]
+        gate = F.silu(self.gate_proj(x))
+        # [B, L, d_model] -> [B, L, hidden_dim]
+        up = self.a_up_proj(x)
+        # [B, L, hidden_dim] -> [B, L, d_model]
+        return self.a_down_proj(gate * up)
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(
+        self,
+        n_heads: int,
+        d_model: int = 512,
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+        use_causal_mask: bool = True,
+    ) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.attn_norm = torch.nn.LayerNorm(d_model)
+        self.attn = Attention(n_heads=n_heads, d_model=d_model, use_causal_mask=use_causal_mask)    
+        self.attn_dropout = torch.nn.Dropout(dropout)
+        
+        self.ffn = torch.nn.Sequential(
+            torch.nn.LayerNorm(d_model),
+            SwiGLU(d_model=d_model, hidden_dim=hidden_dim),
+            torch.nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        # in: [B, L, d_model], out: [B, L, d_model]
+        y = self.attn_norm(x)
+        y = self.attn(y, position_ids)
+        y = self.attn_dropout(y)
+        x = x + y
+
+        return x + self.ffn(x)
+
+class Transformer(torch.nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        n_layers: int,
+        n_heads: int = 2,
+        d_model: int = 512,
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+        use_causal_mask: bool = True,
+        tie_embedding: bool = True,
+    ) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.head_dim = d_model // n_heads
+        assert self.head_dim % 2 == 0
+
+        self.token_embedding = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+        self.embedding_dropout = torch.nn.Dropout(dropout)
+
+        self.layers = torch.nn.ModuleList([
+            TransformerBlock(
+                n_heads=n_heads,
+                d_model=d_model,
+                hidden_dim=hidden_dim,
+                dropout=dropout,
+                use_causal_mask=use_causal_mask,
+            ) for _ in range(n_layers)
+        ])
+
+        self.final_norm = torch.nn.LayerNorm(d_model)
+        # [B, L, d_model] -> [B, L, vocab_size]
+        self.lm_head = torch.nn.Linear(d_model, vocab_size, bias=False)
+        # share weight
+        if tie_embedding:
+            self.lm_head.weight = self.token_embedding.weight
+
+    def forward(self, token_ids: torch.Tensor) -> Any:
+        # [B, L]
+        assert token_ids.dim() == 2 and token_ids.dtype == torch.long
+        batch_size, sequence_length = token_ids.shape
+
+        x = self.token_embedding(token_ids)
+        x = self.embedding_dropout(x)
+
+        # [B, L, d_model]
+        for layer in self.layers:
+            # Outer position ids
+            position_ids = torch.arange(sequence_length, device=token_ids.device, dtype=torch.long)
+            x = layer(x, position_ids)
+
+        # [B, L, d_model]
+        x = self.final_norm(x)
+        # [B, L, d_model] -> [B, L, vocab_size]
+        return self.lm_head(x)
+
+
+# Padding Mask: 屏蔽为了对齐长度而补充的 PAD token。
+# Packed Sequence Mask: 防止拼接在同一序列中的不同样本互相关注, 为了避免浪费训练资源, 将多个短序列合并成一个长序列
