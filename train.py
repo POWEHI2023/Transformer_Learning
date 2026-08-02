@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -10,6 +9,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
+from mstore import save_model
 from ztransformer import Transformer
 
 IGNORE_INDEX = -100
@@ -141,82 +141,43 @@ def main() -> None:
     global_step = 0
     best_validation_loss = float("inf")
 
-    def save_model(
-        saved_path: str | Path,
-        *,
-        completed_epoch: int,
-        validation_loss: float,
-    ) -> None:
-        saved_path = Path(saved_path)
-        saved_path.parent.mkdir(parents=True, exist_ok=True)
-
-        rng_state: dict[str, object] = {
-            "torch": torch.get_rng_state(),
-        }
-        if torch.cuda.is_available():
-            rng_state["cuda"] = torch.cuda.get_rng_state_all()
-
-        torch.save(
-            {
-                "format_version": 1,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "progress": {
-                    "completed_epoch": completed_epoch,
-                    "global_step": global_step,
-                },
-                "metrics": {
-                    "validation_loss": validation_loss,
-                    "best_validation_loss": best_validation_loss,
-                },
-                "model_config": {
-                    "vocab_size": len(tokenizer),
-                    "n_layers": args.layers,
-                    "n_heads": args.heads,
-                    "d_model": args.d_model,
-                    "hidden_dim": args.hidden_dim,
-                    "dropout": args.dropout,
-                    "use_causal_mask": True,
-                    "pad_token_id": tokenizer.pad_token_id,
-                    "tie_embedding": (
-                        model.lm_head.weight is model.token_embedding.weight
-                    ),
-                },
-                "training_config": {
-                    "epochs": args.epochs,
-                    "batch_size": args.batch_size,
-                    "context_length": args.context_length,
-                    "learning_rate": args.lr,
-                    "max_grad_norm": 1.0,
-                    "ignore_index": IGNORE_INDEX,
-                    "optimizer": type(optimizer).__name__,
-                },
-                "dataset_config": {
-                    "name": DATASET_NAME,
-                    "config": DATASET_CONFIG,
-                    "train_split": "train",
-                    "validation_split": "validation",
-                    "empty_texts_filtered": True,
-                },
-                "tokenizer_config": {
-                    "path": str(TOKENIZER_PATH),
-                    "sha256": tokenizer_sha256,
-                    "vocab_size": len(tokenizer),
-                    "pad_token_id": tokenizer.pad_token_id,
-                    "bos_token_id": tokenizer.bos_token_id,
-                    "eos_token_id": tokenizer.eos_token_id,
-                    "unk_token_id": tokenizer.unk_token_id,
-                    "padding_side": tokenizer.padding_side,
-                },
-                "rng_state": rng_state,
-                "runtime": {
-                    "torch_version": torch.__version__,
-                    "device_type": device.type,
-                },
-            },
-            saved_path,
-        )
+    model_config = {
+        "vocab_size": len(tokenizer),
+        "n_layers": args.layers,
+        "n_heads": args.heads,
+        "d_model": args.d_model,
+        "hidden_dim": args.hidden_dim,
+        "dropout": args.dropout,
+        "use_causal_mask": True,
+        "pad_token_id": tokenizer.pad_token_id,
+        "tie_embedding": model.lm_head.weight is model.token_embedding.weight,
+    }
+    training_config = {
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "context_length": args.context_length,
+        "learning_rate": args.lr,
+        "max_grad_norm": 1.0,
+        "ignore_index": IGNORE_INDEX,
+        "optimizer": type(optimizer).__name__,
+    }
+    dataset_config = {
+        "name": DATASET_NAME,
+        "config": DATASET_CONFIG,
+        "train_split": "train",
+        "validation_split": "validation",
+        "empty_texts_filtered": True,
+    }
+    tokenizer_config = {
+        "path": str(TOKENIZER_PATH),
+        "sha256": tokenizer_sha256,
+        "vocab_size": len(tokenizer),
+        "pad_token_id": tokenizer.pad_token_id,
+        "bos_token_id": tokenizer.bos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "unk_token_id": tokenizer.unk_token_id,
+        "padding_side": tokenizer.padding_side,
+    }
 
     for epoch in range(args.epochs):
         model.train()
@@ -267,14 +228,32 @@ def main() -> None:
             best_validation_loss = average_loss
             save_model(
                 "artifacts/model_best.pt",
+                model=model,
+                optimizer=optimizer,
                 completed_epoch=epoch + 1,
+                global_step=global_step,
                 validation_loss=average_loss,
+                best_validation_loss=best_validation_loss,
+                model_config=model_config,
+                training_config=training_config,
+                dataset_config=dataset_config,
+                tokenizer_config=tokenizer_config,
+                device=device,
             )
  
     save_model(
         "artifacts/model.pt",
+        model=model,
+        optimizer=optimizer,
         completed_epoch=args.epochs,
+        global_step=global_step,
         validation_loss=average_loss,
+        best_validation_loss=best_validation_loss,
+        model_config=model_config,
+        training_config=training_config,
+        dataset_config=dataset_config,
+        tokenizer_config=tokenizer_config,
+        device=device,
     )
 
 if __name__ == "__main__":
