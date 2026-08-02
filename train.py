@@ -68,19 +68,20 @@ class LMCollator:
         }
 
 def resolve_device() -> torch.device:
-    try:
-        import torch_npu # type: ignore
-        if torch.npu.is_available():
-            device = torch.device("npu")
-        else:
-            raise Exception("NPU is not available")
-    except Exception:
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+    # try:
+    #     import torch_npu # type: ignore
+    #     if torch.npu.is_available():
+    #         device = torch.device("npu")
+    #     else:
+    #         raise Exception("NPU is not available")
+    # except Exception:
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     return device
 
 def parse_args() -> argparse.Namespace:
@@ -181,6 +182,7 @@ def main() -> None:
         "padding_side": tokenizer.padding_side,
     }
 
+    print("total steps: ", len(train_loader), " device: ", device)
     for epoch in range(args.epochs):
         model.train()
         for batch in train_loader:
