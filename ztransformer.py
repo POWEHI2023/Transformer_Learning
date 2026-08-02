@@ -287,3 +287,8 @@ class Transformer(torch.nn.Module):
 # RoPE: 旋转位置编码, 
 
 # TODO Packed segment attention mask; Packed segment boundary loss mask
+# Packed sequence: 把多个独立样本拼进同一个长序列, 减少 padding 浪费.
+# 1. Attention 层禁止 A, B 互相读取 - Packed segment attention mask
+#       前样本的 token 序列虽然排在后样本的前面, 但不应该参与后样本的上下文, 需要构造 segment mask
+# 2. Loss 层禁止 前序列被训练成预测后序列(不同样本) - Packed segment boundary loss mask
+#       Attention Mask 只是限制了读取哪些 token 不会改变训练目标, 需要无效化 segment 边界对应的 label
