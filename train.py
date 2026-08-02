@@ -95,7 +95,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--context-length", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--moe-auxloss-coeff", type=float, default=0.2)
+    parser.add_argument("--moe-auxloss-coeff", type=float, default=1e-3)
+    parser.add_argument("--moe-zloss-coeff", type=float, default=1e-3)
     return parser.parse_args()
 
 def main() -> None:
@@ -160,6 +161,7 @@ def main() -> None:
         "context_length": args.context_length,
         "learning_rate": args.lr,
         "moe_auxloss_coeff": args.moe_auxloss_coeff,
+        "moe_zloss_coeff": args.moe_zloss_coeff,
         "max_grad_norm": 1.0,
         "ignore_index": IGNORE_INDEX,
         "optimizer": type(optimizer).__name__,
@@ -193,11 +195,16 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             _o: TransformerOutput = model(token_ids=input_ids, attention_mask=attention_mask)
             logits = _o.logits
-            loss = F.cross_entropy(
+            lm_loss = F.cross_entropy(
                 input=logits.reshape(-1, logits.size(-1)),
                 target=labels.reshape(-1),
                 ignore_index=IGNORE_INDEX,
-            ) + args.moe_auxloss_coeff * _o.router_aux_loss
+            )
+            loss = (
+                lm_loss
+                + args.moe_auxloss_coeff * _o.router_aux_loss
+                + args.moe_zloss_coeff * _o.router_z_loss
+            )
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -217,11 +224,16 @@ def main() -> None:
 
                 _o = model(token_ids=input_ids, attention_mask=attention_mask)
                 logits = _o.logits
-                loss = F.cross_entropy(
+                lm_loss = F.cross_entropy(
                     input=logits.reshape(-1, logits.size(-1)),
                     target=labels.reshape(-1),
                     ignore_index=IGNORE_INDEX,
                     reduction="sum",
+                )
+                loss = (
+                    lm_loss
+                    + args.moe_auxloss_coeff * _o.router_aux_loss
+                    + args.moe_zloss_coeff * _o.router_z_loss
                 )
 
                 total_loss += loss.item()

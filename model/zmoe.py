@@ -36,6 +36,7 @@ class RouterStats:
 class FFNOutput:
     hidden_states: torch.Tensor
     aux_loss: torch.Tensor
+    z_loss: torch.Tensor | None
     router_stats: RouterStats | None
 
 
@@ -52,6 +53,7 @@ class DenseFFN(torch.nn.Module):
         return FFNOutput(
             hidden_states=x,
             aux_loss=x.new_zeros((), dtype=torch.float32),
+            z_loss=None,
             router_stats=None,
         )
 

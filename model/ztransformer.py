@@ -10,6 +10,7 @@ from model.zattention import Attention
 class TransformerBlockOutput:
     hidden_states: torch.Tensor
     aux_loss: torch.Tensor
+    z_loss: torch.Tensor | None
     router_stats: RouterStats | None
 
 class TransformerBlock(torch.nn.Module):
@@ -45,6 +46,7 @@ class TransformerBlock(torch.nn.Module):
         return TransformerBlockOutput(
             hidden_states=x + ffn_o.hidden_states,
             aux_loss=ffn_o.aux_loss,
+            z_loss=ffn_o.z_loss,
             router_stats=ffn_o.router_stats,
         )
 
@@ -52,6 +54,7 @@ class TransformerBlock(torch.nn.Module):
 class TransformerOutput:
     logits: torch.Tensor
     router_aux_loss: torch.Tensor
+    router_z_loss: torch.Tensor
     router_stats: list[RouterStats]
 
 class Transformer(torch.nn.Module):
@@ -128,6 +131,7 @@ class Transformer(torch.nn.Module):
 
 
         aux_losses: list[torch.Tensor] = []
+        z_losses: list[torch.Tensor] = []
         router_stats: list[RouterStats] = []
 
         # [B, L, d_model]
@@ -138,6 +142,8 @@ class Transformer(torch.nn.Module):
             if block_o.router_stats is not None:
                 aux_losses.append(block_o.aux_loss)
                 router_stats.append(block_o.router_stats)
+            if block_o.z_loss is not None:
+                z_losses.append(block_o.z_loss)
 
         # [B, L, d_model]
         x = self.final_norm(x)
@@ -149,6 +155,11 @@ class Transformer(torch.nn.Module):
             router_aux_loss=(
                 torch.stack(aux_losses).mean()
                 if len(aux_losses) != 0
+                else logits.new_zeros((), dtype=torch.float32)
+            ),
+            router_z_loss=(
+                torch.stack(z_losses).mean()
+                if len(z_losses) != 0
                 else logits.new_zeros((), dtype=torch.float32)
             ),
             router_stats=router_stats,
