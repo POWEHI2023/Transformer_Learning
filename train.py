@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
 from mstore import save_model
-from ztransformer import Transformer
+from ztransformer import Transformer, TransformerOutput
 
 IGNORE_INDEX = -100
 TOKENIZER_PATH = Path("artifacts/tokenizer.json")
@@ -94,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--context-length", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--moe-auxloss-coeff", type=float, default=0.2)
     return parser.parse_args()
 
 def main() -> None:
@@ -157,6 +158,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "context_length": args.context_length,
         "learning_rate": args.lr,
+        "moe_auxloss_coeff": args.moe_auxloss_coeff,
         "max_grad_norm": 1.0,
         "ignore_index": IGNORE_INDEX,
         "optimizer": type(optimizer).__name__,
@@ -187,12 +189,13 @@ def main() -> None:
             labels = batch["labels"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(token_ids=input_ids, attention_mask=attention_mask)
+            _o: TransformerOutput = model(token_ids=input_ids, attention_mask=attention_mask)
+            logits = _o.logits
             loss = F.cross_entropy(
                 input=logits.reshape(-1, logits.size(-1)),
                 target=labels.reshape(-1),
                 ignore_index=IGNORE_INDEX,
-            )
+            ) + args.moe_auxloss_coeff * _o.router_aux_loss
 
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -210,7 +213,8 @@ def main() -> None:
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
 
-                logits = model(token_ids=input_ids, attention_mask=attention_mask)
+                _o = model(token_ids=input_ids, attention_mask=attention_mask)
+                logits = _o.logits
                 loss = F.cross_entropy(
                     input=logits.reshape(-1, logits.size(-1)),
                     target=labels.reshape(-1),

@@ -2,6 +2,7 @@ import torch
 import math
 from typing import Any
 import torch.nn.functional as F
+from dataclasses import dataclass
 
 class RoPE(torch.nn.Module):
     def __init__(
@@ -160,6 +161,38 @@ class SwiGLU(torch.nn.Module):
         # [B, L, hidden_dim] -> [B, L, d_model]
         return self.a_down_proj(gate * up)
 
+@dataclass
+class RouterStats:
+    tokens_per_expert: torch.Tensor
+    probability_per_expert: torch.Tensor
+
+@dataclass
+class FFNOutput:
+    hidden_states: torch.Tensor
+    aux_loss: torch.Tensor
+    router_stats: RouterStats | None
+
+class DenseFFN(torch.nn.Module):
+    def __init__(self, d_model: int, hidden_dim: int | None = None, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(d_model)
+        self.swiglu = SwiGLU(d_model=d_model, hidden_dim=hidden_dim)
+        self.dropout = torch.nn.Dropout(dropout)
+    # token_mask remained for MoE expansion
+    def forward(self, x: torch.Tensor, token_mask: torch.Tensor | None = None) -> FFNOutput:
+        x = self.dropout(self.swiglu(self.norm(x)))
+        return FFNOutput(
+            hidden_states=x,
+            aux_loss=x.new_zeros((), dtype=torch.float32),
+            router_stats=None,
+        )
+
+@dataclass
+class TransformerBlockOutput:
+    hidden_states: torch.Tensor
+    aux_loss: torch.Tensor
+    router_stats: RouterStats | None
+
 class TransformerBlock(torch.nn.Module):
     def __init__(
         self,
@@ -174,26 +207,33 @@ class TransformerBlock(torch.nn.Module):
         self.attn_norm = torch.nn.LayerNorm(d_model)
         self.attn = Attention(n_heads=n_heads, d_model=d_model, use_causal_mask=use_causal_mask)    
         self.attn_dropout = torch.nn.Dropout(dropout)
-        
-        self.ffn = torch.nn.Sequential(
-            torch.nn.LayerNorm(d_model),
-            SwiGLU(d_model=d_model, hidden_dim=hidden_dim),
-            torch.nn.Dropout(dropout),
-        )
+
+        self.ffn = DenseFFN(d_model=d_model, hidden_dim=hidden_dim, dropout=dropout)
 
     def forward(
         self, 
         x: torch.Tensor, 
         position_ids: torch.Tensor, 
         attention_mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    ) -> TransformerBlockOutput:
         # in: [B, L, d_model], out: [B, L, d_model]
         y = self.attn_norm(x)
         y = self.attn(y, position_ids, attention_mask)
         y = self.attn_dropout(y)
         x = x + y
 
-        return x + self.ffn(x)
+        ffn_o: FFNOutput = self.ffn(x, token_mask=attention_mask)
+        return TransformerBlockOutput(
+            hidden_states=x + ffn_o.hidden_states,
+            aux_loss=ffn_o.aux_loss,
+            router_stats=ffn_o.router_stats,
+        )
+
+@dataclass
+class TransformerOutput:
+    logits: torch.Tensor
+    router_aux_loss: torch.Tensor
+    router_stats: list[RouterStats]
 
 class Transformer(torch.nn.Module):
     def __init__(
@@ -243,7 +283,7 @@ class Transformer(torch.nn.Module):
         token_ids: torch.Tensor, 
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-    ) -> Any:
+    ) -> TransformerOutput:
         # [B, L]
         assert token_ids.dim() == 2 and token_ids.dtype == torch.long
         batch_size, sequence_length = token_ids.shape
@@ -267,15 +307,33 @@ class Transformer(torch.nn.Module):
         if position_ids is None:
             position_ids = torch.arange(sequence_length, device=token_ids.device, dtype=torch.long)
 
+
+        aux_losses: list[torch.Tensor] = []
+        router_stats: list[RouterStats] = []
+
         # [B, L, d_model]
         for layer in self.layers:
             # Outer position ids
-            x = layer(x, position_ids, attention_mask)
+            block_o: TransformerBlockOutput = layer(x, position_ids, attention_mask)
+            x = block_o.hidden_states
+            if block_o.router_stats is not None:
+                aux_losses.append(block_o.aux_loss)
+                router_stats.append(block_o.router_stats)
 
         # [B, L, d_model]
         x = self.final_norm(x)
         # [B, L, d_model] -> [B, L, vocab_size]
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+
+        return TransformerOutput(
+            logits=logits,
+            router_aux_loss=(
+                torch.stack(aux_losses).mean()
+                if len(aux_losses) != 0
+                else logits.new_zeros((), dtype=torch.float32)
+            ),
+            router_stats=router_stats,
+        )
 
 
 # Padding Mask: 屏蔽为了对齐长度而补充的 PAD token。
