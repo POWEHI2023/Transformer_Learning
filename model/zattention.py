@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import torch
-from zposition import RoPE
+from model.zposition import RoPE
 
 class Attention(torch.nn.Module):
     def __init__(

@@ -9,8 +9,8 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
-from mstore import save_model
-from ztransformer import Transformer, TransformerOutput
+from model.mstore import save_model
+from model.ztransformer import Transformer, TransformerOutput
 
 IGNORE_INDEX = -100
 TOKENIZER_PATH = Path("artifacts/tokenizer.json")

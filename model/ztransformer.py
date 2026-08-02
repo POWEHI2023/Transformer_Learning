@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass
-from zmoe import RouterStats, FFNOutput, DenseFFN
-from zattention import Attention
+from model.zmoe import RouterStats, FFNOutput, DenseFFN
+from model.zattention import Attention
     
 
 @dataclass
