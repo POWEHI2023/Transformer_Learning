@@ -38,7 +38,7 @@ class TransformerBlock(torch.nn.Module):
     ) -> TransformerBlockOutput:
         # in: [B, L, d_model], out: [B, L, d_model]
         y = self.attn_norm(x)
-        y = self.attn(y, position_ids, attention_mask)
+        y, _, _ = self.attn(y, position_ids, attention_mask)
         y = self.attn_dropout(y)
         x = x + y
 
