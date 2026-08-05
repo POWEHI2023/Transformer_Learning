@@ -84,3 +84,51 @@ class Attention(torch.nn.Module):
         o = o.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
 
         return self.output_proj(o)
+
+
+class InferAttention_MHA(torch.nn.Module):
+    def __init__(
+        self,
+        n_heads: int,
+        d_model: int = 512,
+        use_causal_mask: bool = True,
+        rope_base: float = 10_000.0,
+    ) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.head_dim = self.d_model // self.n_heads
+        assert self.head_dim % 2 == 0
+        self.use_causal_mask = use_causal_mask
+
+        self.input_proj = torch.nn.Linear(self.d_model, 3 * self.d_model)
+        self.output_proj = torch.nn.Linear(self.d_model, self.d_model)
+
+        self.rope = RoPE(head_dim=self.head_dim, base=rope_base)
+
+    def forward(
+        self, 
+        x: torch.Tensor,        # [B, 1, d_model]
+        cached_k: torch.Tensor, # [B, S, d_model]
+        cached_v: torch.Tensor, # [B, S, d_model]
+        position_ids: torch.Tensor, 
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self.input_proj(x)
+        # 3 * [B, 1, d_model]
+        q, k, v = x.chunk(3, dim=-1)
+
+        # 2 * [B, S + 1, d_model]
+        k = torch.cat([cached_k, k], dim=-2)
+        v = torch.cat([cached_v, v], dim=-1)
+
+
+class InferAttention_MQA(torch.nn.Module):
+    pass
+
+class InferAttention_GQA(torch.nn.Module):
+    pass
+
+class InferAttention_MLA(torch.nn.Module):
+    pass
