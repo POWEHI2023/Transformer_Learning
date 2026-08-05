@@ -168,10 +168,115 @@ class DecodeAttention_MHA(torch.nn.Module):
         return o, k_cache, v_cache
 
 
-class InferAttention_MQA(torch.nn.Module):
-    pass
+class MultiQueryAttention(torch.nn.Module):
+    def __init__(
+        self, 
+        d_model: int, 
+        n_head: int, 
+        use_causal_mask: bool = True, 
+        rope_base: float = 10_000.0
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.n_head = n_head
+        assert self.d_model % self.n_head == 0
+        self.d_head = self.d_model // self.n_head
+        assert self.d_head % 2 == 0
+        # 生成 causal mask 支持 Decoder-only Transformer
+        # 不生成 causal mask 支持双向 Attention 或 Cross-Attention
+        self.use_causal_mask = use_causal_mask
 
-class InferAttention_GQA(torch.nn.Module):
+        self.input_proj = torch.nn.Linear(self.d_model, self.d_model + 2 * self.d_head)
+        self.output_proj = torch.nn.Linear(self.d_model, self.d_model)
+
+        self.rope = RoPE(head_dim=self.d_head, base=rope_base)
+
+    def forward(
+        self,
+        x: torch.Tensor,    # [B, T, d_model]
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,    # default do training
+    ) -> tuple[
+        torch.Tensor, 
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        # forbid past_key_value is not None and use_cache is False
+        # because we need update cache in this case
+        assert past_key_value is None or use_cache
+
+        batch_size, sequence_length, d_model = x.shape
+        assert d_model == self.d_model
+
+        # Q: [B, H, T, d_head], KV: [B, 1, T, d_head]
+        qkv: torch.Tensor = self.input_proj(x) # [B, T, d_model + 2 * d_head]
+        q, k, v = qkv.split([self.d_model, self.d_head, self.d_head], dim=-1)
+
+        q = q.view(batch_size, sequence_length, self.n_head, self.d_head).transpose(1, 2)
+        k = k.view(batch_size, sequence_length, 1, self.d_head).transpose(1, 2)
+        v = v.view(batch_size, sequence_length, 1, self.d_head).transpose(1, 2)
+
+        q = self.rope(q, position_ids)
+        k = self.rope(k, position_ids)
+
+        if past_key_value is not None:
+            # [B, 1, S, d_head]
+            k_cached, v_cached = past_key_value
+            assert k_cached.ndim == 4 and v_cached.ndim == 4
+            assert k_cached.shape == v_cached.shape
+            assert k_cached.shape[0] == batch_size
+            assert k_cached.shape[1] == 1
+            assert k_cached.shape[-1] == self.d_head
+
+            past_length = k_cached.size(-2)
+
+            # Decoder: [B, 1, S+T, d_head]
+            k = torch.cat([k_cached, k], dim=-2)
+            v = torch.cat([v_cached, v], dim=-2)
+        else: past_length = 0
+
+        # [B, H, T, D] @ [B, 1, D, S] -> [B, H, T, S]
+        s = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
+
+        q_len = q.shape[2]
+        k_len = k.shape[2]
+
+        blocked_mask = None
+        query_positions = past_length + torch.arange(q_len, device=q.device)
+        key_positions = torch.arange(k_len, device=q.device)
+        # q @ k^T -> [q_len, k_len]
+        # Query 位置 i 只能读取 Key 位置 <= i, 当 Key Position > Query Position 就需要被屏蔽
+        # Key Position: [None, :] -> [[0, 1, 2, 3]], 表示每一列对应的 Key 的位置
+        # Query Position: [:, None] -> [[0], [1], [2], [3]], 表示每一行对应 Query 的位置
+        # 广播之后 mask 的形状为 [Q, K], 每个位置表示 Q Pos < K Pos 时为 True 需要屏蔽, 否则为 False
+        if self.use_causal_mask:
+            causal_mask = key_positions[None, :] > query_positions[:, None] # 可以满足 Chunked Decode
+            # [Q, K]
+            blocked_mask = causal_mask
+
+        if attention_mask is not None:
+            assert attention_mask.shape == (batch_size, k_len)
+            # [B, 1, 1, K]
+            attention_mask = ~attention_mask.to(device=s.device, dtype=torch.bool)[:, None, None, :]
+            # [B, 1, Q, K]
+            blocked_mask = (
+                attention_mask
+                if blocked_mask is None
+                else blocked_mask | attention_mask
+            )
+
+        if blocked_mask is not None:
+            s = s.masked_fill(blocked_mask, float("-inf"))
+
+        o = torch.softmax(s, dim=-1) @ v
+        o = o.transpose(1, 2).reshape(batch_size, sequence_length, d_model)
+
+        return self.output_proj(o), (k, v) if use_cache else None
+
+        
+class GroupQueryAttention(torch.nn.Module):
     pass
 
 class InferAttention_MLA(torch.nn.Module):
