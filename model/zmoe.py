@@ -132,6 +132,114 @@ class TopKRouter(torch.nn.Module):
             ),
         )
 
-
+# 介绍一下 GEMM, 通用矩阵乘法, 如果在 for 循环中计算很多个 Expert 会导致启动很多个计算 Kernel
+# 效率很差, 因此 Group GEMM 可以在 GPU Kernel 内部统一调度这些矩阵乘法提高效率,
+# Batched GEMM 通常要求每组矩阵乘法形状相同， 所有的 Expert 必须有相同的 Token 数量,
+# 但是 MoE 中每个 Expert 收到的 Token 数量通常不同, Grouped GEMM 可以处理不同的矩阵尺寸, 更适合 MoE.
+# ---
+# GEMM 是一次矩阵乘法；Grouped GEMM 是将多个 Expert 的、token 数可能不同的矩阵乘法统一提交和调度，从而减少小 kernel 启动开销并提高 GPU 利用率。
 class TopKSparseMoE(torch.nn.Module):
-    pass
+    '''
+    Token Mask 的作用: TODO ...
+    '''
+    def __init__(
+        self, 
+        d_model: int,
+        config: MoEConfig,
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.d_model = d_model
+        self.config = config
+
+        # shared pre-norm
+        self.norm = torch.nn.LayerNorm(d_model)
+        # Top-K router
+        self.router = TopKRouter(d_model=self.d_model, config=self.config)
+        # experts
+        self.experts = torch.nn.ModuleList([
+            SwiGLU(d_model=self.d_model, hidden_dim=hidden_dim)
+            for _ in range(config.expert_num)
+        ])
+        # shared dropout
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor, # [B, L, D]
+        token_mask: torch.Tensor | None = None, # [B, L]
+    ) -> FFNOutput:
+        assert x.ndim == 3
+        batch_size, sequence_length, d_model = x.shape
+        assert d_model == self.d_model
+
+        # Token Mask
+        token_mask = token_mask if token_mask is not None else torch.ones(batch_size, sequence_length)
+        assert token_mask.shape == (batch_size, sequence_length)
+        token_mask = token_mask.to(dtype=torch.bool, device=x.device)
+
+        # Normalize and Flatten
+        normalized_x = self.norm(x)
+        # [B, L, D] -> [B * L, D]
+        flat_x: torch.Tensor = normalized_x.reshape(batch_size * sequence_length, self.d_model)
+        flat_mask: torch.Tensor = token_mask.reshape(-1)
+
+        # 避免把 PAD token 送入 Router,
+        # 影响 tokens_per_expert/probability_per_expert/auxiliary loss/z-loss
+        valid_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            raise ValueError("TopKSparseMoE requires at least one valid token")
+        # [T, D]
+        valid_x = flat_x.index_select(dim=0, index=valid_indices)
+
+        # [T, K], [T, K]
+        router_output: RouterOutput = self.router(valid_x)
+
+        # build buffer for experts' output, shape is [T, D]
+        # 累加所有 Expert 的加权结果
+        valid_output = torch.zeros_like(valid_x)
+
+        # !!! dispatch
+        for expert_index, expert in enumerate(self.experts):
+            # 每个 Token 的 K 个 Expert ID 中是否存在等于 expert_index 的 ID
+            selected = (router_output.expert_indices == expert_index)
+            # 把 Expert ID 中存在 expert_index 的 token id 返回,
+            # route_slots 表示 Top K 中的第几个槽位选择当前 Expert.
+            token_indices, route_slots = selected.nonzero(as_tuple=True)
+
+            if token_indices.numel() == 0:
+                # 没有 token 选择当前 expert
+                continue
+
+            # T 维根据选择的 token index 取出 token, 形状为 [T_e, D]
+            expert_input = valid_x.index_select(dim=0, index=token_indices)
+            # SwiGLU: input[T, D] -> [T, D]
+            expert_output: torch.Tensor = expert(expert_input)
+
+            # 加权记录结果, 每个 index 处的 slot 记录了 token 选择 Top-K 中当前 expert 占有的权重
+            # shape is: [T_e]
+            weights = router_output.expert_weights[token_indices, route_slots]
+            weights = weights.to(dtype=expert_output.dtype)
+            # [T_e, D] * [T_e, 1] -> 广播计算 D 维度乘同一个 weight [T_e, D]
+            weighted_output = expert_output * weights.unsqueeze(-1)
+
+            # 缓存加权结果: valid_output[token_indices[i]] += weighted_output[i]
+            valid_output.index_add_(dim=0, index=token_indices, source=weighted_output)
+
+        # valid_output 中只记录了 mask 之后不包含 PAD 的有效 token,
+        # 需要把有效 token 映射回原本的总 token 空间中.
+        flat_output = torch.zeros_like(flat_x)
+        flat_output = flat_output.index_copy(dim=0, index=valid_indices, source=valid_output)
+
+        output = flat_output.reshape(batch_size, sequence_length, self.d_model)
+        output = self.dropout(output)
+
+        # Token FFN 结果和 Router 的状态和损失
+        return FFNOutput(
+            hidden_states=output,
+            aux_loss=router_output.aux_loss,
+            z_loss=router_output.z_loss,
+            router_stats=router_output.stats,
+        )
