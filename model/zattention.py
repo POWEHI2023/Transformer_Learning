@@ -416,6 +416,107 @@ class GroupQueryAttention(torch.nn.Module):
 
         return self.output_proj(o), (k, v) if use_cache else None
 
+class GroupQueryAttention_V2(GroupQueryAttention):
+    '''
+    einsum 是一种用下标描述张量乘法、广播和归约的接口，让 GQA 的数学结构很清楚。
+    '''
+    def forward(
+        self,
+        x: torch.Tensor,    # [B, S, d_model]
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        batch_size, sequence_length, d_model = x.shape
+        assert d_model == self.d_model
+
+        qkv: torch.Tensor = self.input_proj(x) # [B, S, d_model + kv_d_model + kv_d_model]
+        q, k, v = qkv.split(
+            [self.d_model, self.kv_d_model, self.kv_d_model],
+            dim=-1,
+        )
+
+        # [B, H, S, D]
+        q = q.view(batch_size, sequence_length, self.n_head, self.d_head).transpose(1, 2)
+        # [B, G, S, D]
+        k = k.view(batch_size, sequence_length, self.n_kv_head, self.d_head).transpose(1, 2)
+        v = v.view(batch_size, sequence_length, self.n_kv_head, self.d_head).transpose(1, 2)
+
+        # append position for each position
+        q = self.rope(q, position_ids)
+        k = self.rope(k, position_ids)
+
+        if past_key_value is not None:
+            # in this case, x can be chunked request, so the S uppon means chunked sequence length
+            # make chunked sequence length as `ChunkS`
+
+            # [B, G, HistoryS, D]
+            k_cached, v_cached = past_key_value
+            assert k_cached.ndim == 4 and v_cached.ndim == 4
+            assert k_cached.shape == v_cached.shape
+            assert k_cached.shape[:2] == (batch_size, self.n_kv_head)
+            assert k_cached.shape[-1] == self.d_head
+
+            # History Sequence Length
+            past_length = k_cached.shape[2]
+
+            # [B, G, HistoryS + ChunkS, D]
+            k = torch.cat([k_cached, k], dim=-2)
+            v = torch.cat([v_cached, v], dim=-2)
+        # k is RoPEd now, and we need causal mask and attention mask later
+        else: past_length = 0
+
+        q_len, k_len = q.shape[2], k.shape[2]
+        query_positions = past_length + torch.arange(q_len, device=q.device)
+        key_positions = torch.arange(k_len, device=q.device)
+
+        blocked_mask = None
+        if self.use_causal_mask:
+            # [Q, K] -> [1, 1, 1, Q, K]
+            blocked_mask = (key_positions[None, :] > query_positions[:, None])[None, None, None, :, :]
+
+        if attention_mask is not None:
+            assert attention_mask.shape == (batch_size, k_len)
+            valid_keys = attention_mask.to(device=q.device, dtype=torch.bool)
+            if not valid_keys.any(dim=-1).all():
+                raise ValueError("Every sample must contain at least one valid key")
+
+            # [B, 1, 1, 1, K_len]
+            attention_mask = ~valid_keys[:, None, None, None, :]
+            # [B, 1, 1, Q, K_len]
+            blocked_mask = (
+                attention_mask
+                if blocked_mask is None
+                else blocked_mask | attention_mask
+            )
+
+        # [B, G, R, Q, D]
+        q_grouped = q.reshape(batch_size, self.n_kv_head, self.head_per_group, sequence_length, self.d_head)
+        # [B, G, R, Q, K]
+        s = torch.einsum(
+            "bgrqd,bgkd->bgrqk",
+            q_grouped, k,
+        ) / math.sqrt(self.d_head)
+
+        if blocked_mask is not None:
+            s = s.masked_fill(blocked_mask, float("-inf"))
+
+        attention_weights = torch.softmax(s, dim=-1)
+        # [B, G, R, Q, D]
+        output_grouped = torch.einsum(
+            "bgrqk,bgkd->bgrqd",
+            attention_weights, v,
+        )
+
+        output = output_grouped.view(batch_size, self.n_head, sequence_length, self.d_head)
+        output = output.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
+
+        return self.output_proj(output), (k, v) if use_cache else None
 
 class InferAttention_MLA(torch.nn.Module):
     pass
