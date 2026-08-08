@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass
-from model.zmoe import RouterStats, FFNOutput, DenseFFN
+from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig
 from model.zattention import Attention
     
 
@@ -21,6 +21,7 @@ class TransformerBlock(torch.nn.Module):
         hidden_dim: int | None = None,
         dropout: float = 0.0,
         use_causal_mask: bool = True,
+        moe_config: MoEConfig | None = None,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0
@@ -28,7 +29,16 @@ class TransformerBlock(torch.nn.Module):
         self.attn = Attention(n_heads=n_heads, d_model=d_model, use_causal_mask=use_causal_mask)    
         self.attn_dropout = torch.nn.Dropout(dropout)
 
-        self.ffn = DenseFFN(d_model=d_model, hidden_dim=hidden_dim, dropout=dropout)
+        self.ffn = (
+                TopKSparseMoE(
+                    d_model,
+                    config=moe_config,
+                    hidden_dim=hidden_dim,
+                    dropout=dropout,
+                )
+                if moe_config is not None
+                else DenseFFN(d_model=d_model, hidden_dim=hidden_dim, dropout=dropout)
+        )
 
     def forward(
         self, 
@@ -69,6 +79,7 @@ class Transformer(torch.nn.Module):
         use_causal_mask: bool = True,
         tie_embedding: bool = True,
         pad_token_id: int | None = None,
+        moe_config: MoEConfig | None = None,
     ) -> None:
         super().__init__()
         assert d_model % n_heads == 0
@@ -90,6 +101,7 @@ class Transformer(torch.nn.Module):
                 hidden_dim=hidden_dim,
                 dropout=dropout,
                 use_causal_mask=use_causal_mask,
+                moe_config=moe_config,
             ) for _ in range(n_layers)
         ])
 
