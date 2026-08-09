@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass
-from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig, GEMM_TopKSparseMoE
+from model.zmoe import RouterStats, FFNOutput, build_ffn
 from model.zattention import AttentionOutput, build_attention
-from configs.zconfig import AttentionConfig
+from configs.zconfig import ModelConfig
 
 
 @dataclass
@@ -17,39 +17,15 @@ class TransformerBlockOutput:
 class TransformerBlock(torch.nn.Module):
     def __init__(
         self,
-        n_heads: int,
-        hidden_dim: int,
-        d_model: int = 512,
-        dropout: float = 0.0,
-        use_causal_mask: bool = True,
-        moe_config: MoEConfig | None = None,
+        model_config: ModelConfig,
     ) -> None:
         super().__init__()
-        assert d_model % n_heads == 0
-        self.attn_norm = torch.nn.LayerNorm(d_model)
-        _attn_config = AttentionConfig(
-            kind="gqa",
-            backend="einsum",
-            n_heads=n_heads,
-            n_kv_heads=2,
-            use_packed_segment=False,
-            use_causal_mask=use_causal_mask,
-            rope_base=10_000.0,
-        )
-        self.attn = build_attention(d_model=d_model, config=_attn_config)
-        self.attn_dropout = torch.nn.Dropout(dropout)
+        self.attn_norm = torch.nn.LayerNorm(model_config.d_model)
 
-        self.ffn = (
-                GEMM_TopKSparseMoE(
-                    d_model,
-                    config=moe_config,
-                    hidden_dim=hidden_dim,
-                    dropout=dropout,
-                    use_grouped_gemm=False,
-                )
-                if moe_config is not None
-                else DenseFFN(d_model=d_model, hidden_dim=hidden_dim, dropout=dropout)
-        )
+        self.attn = build_attention(d_model=model_config.d_model, config=model_config.attention)
+        self.attn_dropout = torch.nn.Dropout(model_config.dropout)
+
+        self.ffn = build_ffn(model_config.d_model, model_config.dropout, model_config.ffn)
 
     def forward(
         self, 
@@ -82,45 +58,31 @@ class Transformer(torch.nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        n_layers: int,
-        hidden_dim: int,
-        n_heads: int = 4,
-        d_model: int = 512,
-        dropout: float = 0.0,
-        use_causal_mask: bool = True,
-        tie_embedding: bool = True,
+        model_config: ModelConfig,
         pad_token_id: int | None = None,
-        moe_config: MoEConfig | None = None,
     ) -> None:
         super().__init__()
-        assert d_model % n_heads == 0
-        self.head_dim = d_model // n_heads
-        assert self.head_dim % 2 == 0
+        model_config.validate()
+        self.model_config = model_config
 
         self.pad_token_id = pad_token_id
         self.token_embedding = torch.nn.Embedding(
             num_embeddings=vocab_size, 
-            embedding_dim=d_model, 
+            embedding_dim=model_config.d_model, 
             padding_idx=pad_token_id,
         )
-        self.embedding_dropout = torch.nn.Dropout(dropout)
+        self.embedding_dropout = torch.nn.Dropout(model_config.dropout)
 
         self.layers = torch.nn.ModuleList([
-            TransformerBlock(
-                n_heads=n_heads,
-                d_model=d_model,
-                hidden_dim=hidden_dim,
-                dropout=dropout,
-                use_causal_mask=use_causal_mask,
-                moe_config=moe_config,
-            ) for _ in range(n_layers)
+            TransformerBlock(model_config=model_config) 
+            for _ in range(model_config.n_layers)
         ])
 
-        self.final_norm = torch.nn.LayerNorm(d_model)
+        self.final_norm = torch.nn.LayerNorm(model_config.d_model)
         # [B, L, d_model] -> [B, L, vocab_size]
-        self.lm_head = torch.nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head = torch.nn.Linear(model_config.d_model, vocab_size, bias=False)
         # share weight
-        self.tie_embedding = tie_embedding
+        self.tie_embedding = model_config.tie_embedding
         # if tie_embedding and self.pad_token_id is None:
         if self.tie_embedding:
             self.lm_head.weight = self.token_embedding.weight

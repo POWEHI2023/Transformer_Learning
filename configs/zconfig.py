@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Dict, Any
+from typing import Literal, Mapping, Any
 
 import yaml
 
@@ -119,3 +120,52 @@ def model_config_from_dict(
     parallel_data: Mapping[str, Any] | None = None,
 ) -> ModelConfig:
     ...
+
+def build_model_config(args: argparse.Namespace) -> ModelConfig:
+    n_kv_heads = (
+        None
+        if args.attention_kind == "mha"
+        else 1
+        if args.attention_kind == "mqa"
+        else args.n_kv_heads
+    )
+    attention_config = AttentionConfig(
+        kind=args.attention_kind,
+        backend=args.attention_backend,
+        n_heads=args.heads,
+        n_kv_heads=n_kv_heads,
+        use_packed_segment=False,
+        use_causal_mask=True,
+        rope_base=10_000.0,
+    )
+
+    moe_config = (
+        MoEConfig(
+            expert_num=args.expert_num,
+            top_k=args.top_k,
+            use_z_loss=args.use_moe_z_loss,
+        )
+        if args.use_moe
+        else None
+    )
+    ffn_config = FFNConfig(
+        kind="moe" if args.use_moe else "dense",
+        backend=args.moe_backend if args.use_moe else "eager",
+        hidden_dim=args.hidden_dim,
+        moe=moe_config,
+        gemm=(
+            GEMMConfig(mode=args.gemm_mode)
+            if args.use_moe and args.moe_backend == "gemm"
+            else None
+        ),
+    )
+    model_config = ModelConfig(
+        n_layers=args.layers,
+        d_model=args.d_model,
+        dropout=args.dropout,
+        tie_embedding=args.tie_embedding,
+        attention=attention_config,
+        ffn=ffn_config,
+    )
+    model_config.validate()
+    return model_config

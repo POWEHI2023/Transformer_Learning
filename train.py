@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import argparse
 import hashlib
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -10,8 +10,9 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
 from model.mstore import save_model
-from model.zmoe import MoEConfig
 from model.ztransformer import Transformer, TransformerOutput
+from configs.zconfig import build_model_config
+from configs.zparser import parse_args
 
 IGNORE_INDEX = -100
 TOKENIZER_PATH = Path("artifacts/tokenizer.json")
@@ -77,14 +78,6 @@ def resolve_device() -> torch.device:
         device = torch.device("cpu")
     return device
 
-
-def int_greater_than_one(value: str) -> int:
-    parsed_value = int(value)
-    if parsed_value <= 1:
-        raise argparse.ArgumentTypeError(f"expected an integer greater than 1, got {parsed_value}")
-    return parsed_value
-
-
 def format_router_stats(output: TransformerOutput) -> str:
     layer_stats: list[str] = []
     for layer_index, stats in enumerate(output.router_stats):
@@ -97,35 +90,9 @@ def format_router_stats(output: TransformerOutput) -> str:
         )
     return " | ".join(layer_stats)
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a dense or MoE Transformer language model on WikiText-2.")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--layers", type=int, default=4)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--hidden-dim", type=int, default=384)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--lr", type=float, default=0.0003)
-    parser.add_argument("--context-length", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--moe-auxloss-coeff", type=float, default=1e-3)
-    parser.add_argument("--moe-zloss-coeff", type=float, default=1e-3)
-
-    # MoE Config
-    parser.add_argument("--expert-num", type=int_greater_than_one, default=4)
-    parser.add_argument("--top-k", type=int_greater_than_one, default=2)
-    parser.add_argument("--use-moe", action="store_true")
-    parser.add_argument("--use-moe-z-loss", action="store_true")
-    args = parser.parse_args()
-    if args.top_k > args.expert_num:
-        parser.error(
-            f"--top-k ({args.top_k}) must be less than or equal to --expert-num ({args.expert_num})"
-        )
-    return args
-
 def main() -> None:
     args = parse_args()
+    model_config = build_model_config(args)
 
     tokenizer = load_tokenizer(str(TOKENIZER_PATH))
     tokenizer_sha256 = file_sha256(TOKENIZER_PATH)
@@ -149,28 +116,12 @@ def main() -> None:
         num_workers=0,
     )
 
-    moe_config = (
-        MoEConfig(
-            expert_num=args.expert_num,
-            top_k=args.top_k,
-            use_z_loss=args.use_moe_z_loss,
-        )
-        if args.use_moe
-        else None
-    )
-
     # Embedding weight: [vocab_size, d_model]
     # LM Head weight: [vocab_size, d_model]
     model = Transformer(
         vocab_size=len(tokenizer),
-        n_layers=args.layers,
-        n_heads=args.heads,
-        d_model=args.d_model,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        use_causal_mask=True,
+        model_config=model_config,
         pad_token_id=tokenizer.pad_token_id,
-        moe_config=moe_config,
     )
 
     device = resolve_device()
@@ -181,26 +132,10 @@ def main() -> None:
     global_step = 0
     best_validation_loss = float("inf")
 
-    model_config = {
+    checkpoint_model_config = {
         "vocab_size": len(tokenizer),
-        "n_layers": args.layers,
-        "n_heads": args.heads,
-        "d_model": args.d_model,
-        "hidden_dim": args.hidden_dim,
-        "dropout": args.dropout,
-        "use_causal_mask": True,
         "pad_token_id": tokenizer.pad_token_id,
-        "tie_embedding": model.lm_head.weight is model.token_embedding.weight,
-        "ffn_type": "moe" if moe_config is not None else "dense",
-        "moe_config": (
-            {
-                "expert_num": moe_config.expert_num,
-                "top_k": moe_config.top_k,
-                "use_z_loss": moe_config.use_z_loss,
-            }
-            if moe_config is not None
-            else None
-        ),
+        **asdict(model_config),
     }
     training_config = {
         "epochs": args.epochs,
@@ -237,16 +172,31 @@ def main() -> None:
         f"context_length={args.context_length}, lr={args.lr}"
     )
     print(
-        f"model_config: layers={args.layers}, heads={args.heads}, "
-        f"d_model={args.d_model}, hidden_dim={args.hidden_dim}, dropout={args.dropout}, "
+        f"model_config: layers={model_config.n_layers}, d_model={model_config.d_model}, "
+        f"dropout={model_config.dropout}, tie_embedding={model_config.tie_embedding}, "
         f"trainable_parameters={sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad):,}"
     )
-    if moe_config is not None:
+    attention_config = model_config.attention
+    print(
+        f"attention_config: kind={attention_config.kind}, backend={attention_config.backend}, "
+        f"heads={attention_config.n_heads}, kv_heads={attention_config.n_kv_heads}, "
+        f"causal={attention_config.use_causal_mask}, "
+        f"packed_segment={attention_config.use_packed_segment}, rope_base={attention_config.rope_base}"
+    )
+    ffn_config = model_config.ffn
+    print(
+        f"ffn_config: kind={ffn_config.kind}, backend={ffn_config.backend}, "
+        f"hidden_dim={ffn_config.hidden_dim}"
+    )
+    if ffn_config.moe is not None:
+        moe_config = ffn_config.moe
         print(
             f"moe_config: experts={moe_config.expert_num}, top_k={moe_config.top_k}, "
             f"use_z_loss={moe_config.use_z_loss}, "
             f"aux_coeff={args.moe_auxloss_coeff}, z_coeff={args.moe_zloss_coeff}"
         )
+        if ffn_config.gemm is not None:
+            print(f"gemm_config: mode={ffn_config.gemm.mode}")
     else:
         print("moe_config: disabled (using DenseFFN)")
 
@@ -336,7 +286,7 @@ def main() -> None:
                 global_step=global_step,
                 validation_loss=average_loss,
                 best_validation_loss=best_validation_loss,
-                model_config=model_config,
+                model_config=checkpoint_model_config,
                 training_config=training_config,
                 dataset_config=dataset_config,
                 tokenizer_config=tokenizer_config,
@@ -351,7 +301,7 @@ def main() -> None:
         global_step=global_step,
         validation_loss=average_loss,
         best_validation_loss=best_validation_loss,
-        model_config=model_config,
+        model_config=checkpoint_model_config,
         training_config=training_config,
         dataset_config=dataset_config,
         tokenizer_config=tokenizer_config,

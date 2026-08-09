@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from configs.zconfig import FFNConfig, MoEConfig
 
 
 class SwiGLU(torch.nn.Module):
@@ -59,19 +60,6 @@ class DenseFFN(torch.nn.Module):
             router_stats=None,
         )
 
-
-@dataclass
-class MoEConfig:
-    expert_num: int
-    top_k: int
-    use_z_loss: bool = False # 限制 Router Logits 过快变大, 避免 softmax 接近 ont-host
-
-    # 验证一下有效性, 避免 (expert_num=4, top_k=0) 之类的错误 config
-    def __post_init__(self) -> None:
-        if self.expert_num <= 0:
-            raise ValueError("expert_num must be greater than zero")
-        if not 1 <= self.top_k <= self.expert_num:
-            raise ValueError("top_k must satisfy 1 <= top_k <= expert_num")
 
 @dataclass
 class RouterOutput:
@@ -518,3 +506,36 @@ def load_eager_from_gemm(eager_moe: TopKSparseMoE, gemm_moe: GEMM_TopKSparseMoE)
         expert.a_up_proj.weight.copy_(a_up_proj[expert_index].T)
         expert.a_down_proj.weight.copy_(gemm_moe.down_weight[expert_index].T)
     
+def build_ffn(
+    d_model: int,
+    dropout: float,
+    ffn_config: FFNConfig
+) -> DenseFFN | TopKSparseMoE | GEMM_TopKSparseMoE:
+    ffn_config.validate()
+    if ffn_config.kind == "dense":
+        ffn = DenseFFN(
+            d_model=d_model,
+            hidden_dim=ffn_config.hidden_dim,
+            dropout=dropout,
+        )
+    else:
+        assert ffn_config.moe is not None
+        if ffn_config.backend == "eager":
+            ffn = TopKSparseMoE(
+                d_model,
+                config=ffn_config.moe,
+                hidden_dim=ffn_config.hidden_dim,
+                dropout=dropout,
+            )
+        elif ffn_config.backend == "gemm":
+            assert ffn_config.gemm is not None
+            ffn = GEMM_TopKSparseMoE(
+                d_model,
+                config=ffn_config.moe,
+                hidden_dim=ffn_config.hidden_dim,
+                dropout=dropout,
+                use_grouped_gemm=ffn_config.gemm.mode == "grouped",
+            )
+        else:
+            raise ValueError(f"Unsupported FFN backend: {ffn_config.backend}")
+    return ffn
