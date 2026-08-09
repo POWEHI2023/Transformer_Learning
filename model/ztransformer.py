@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from dataclasses import dataclass
 from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig, GEMM_TopKSparseMoE
-from model.zattention import MultiHeadAttention, AttentionOutput
+from model.zattention import AttentionOutput, MultiHeadAttention, MultiQueryAttention
 from configs.zconfig import AttentionConfig
 
 
@@ -28,15 +28,15 @@ class TransformerBlock(torch.nn.Module):
         assert d_model % n_heads == 0
         self.attn_norm = torch.nn.LayerNorm(d_model)
         _attn_config = AttentionConfig(
-            kind="mha",
+            kind="mqa",
             backend="eager",
             n_heads=n_heads,
-            n_kv_heads=None,
+            n_kv_heads=1,
             use_packed_segment=False,
             use_causal_mask=use_causal_mask,
             rope_base=10_000.0,
         )
-        self.attn = MultiHeadAttention(d_model=d_model, config=_attn_config)
+        self.attn = MultiQueryAttention(d_model=d_model, config=_attn_config)
         self.attn_dropout = torch.nn.Dropout(dropout)
 
         self.ffn = (
