@@ -467,7 +467,17 @@ class GEMM_TopKSparseMoE(BaseTopKSparseMoE):
         return sorted_output
 
     def _experts_grouped(self, sorted_x: torch.Tensor, routing_plan: RoutingPlan) -> torch.Tensor:
-        raise RuntimeError("Waiting for Impl...")
+        # 使用结束位置, [E]
+        offs = routing_plan.expert_offsets[1:].to(dtype=torch.int32, device=sorted_x.device)
+
+        # [T * K, D] [E, D, 2H] -> [T * K, 2H]
+        gate_up = F.grouped_mm(sorted_x, self.gate_up_weight, offs=offs)
+        gate, up = gate_up.split(self.d_hidden, dim=-1)
+        hidden = F.silu(gate) * up
+
+        # [T * K, H] [E, H, D] -> [T * K, D]
+        sorted_output = F.grouped_mm(hidden, self.down_weight, offs=offs)
+        return sorted_output
 
 @torch.no_grad()
 def load_gemm_from_eager(gemm_moe: GEMM_TopKSparseMoE, eager_moe: TopKSparseMoE) -> None:

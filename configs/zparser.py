@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-moe", action="store_true")
     parser.add_argument("--use-moe-z-loss", action="store_true")
     parser.add_argument("--moe-backend", choices=("eager", "gemm"), default="gemm")
-    parser.add_argument("--gemm-mode", choices=("batched", "grouped"), default="batched")
+    parser.add_argument("--gemm-mode", choices=("batched", "grouped"), default="grouped")
     args = parser.parse_args()
     if args.top_k > args.expert_num:
         parser.error(
@@ -57,6 +57,4 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--heads ({args.heads}) must be divisible by --n-kv-heads ({args.n_kv_heads})"
         )
-    if args.use_moe and args.moe_backend == "gemm" and args.gemm_mode == "grouped":
-        parser.error("--gemm-mode=grouped is not implemented yet; use --gemm-mode=batched")
     return args
