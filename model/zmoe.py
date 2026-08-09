@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
 
 class SwiGLU(torch.nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int | None = None) -> None:
+    def __init__(self, d_model: int, hidden_dim: int) -> None:
         super().__init__()
         self.d_model = d_model
-        self.hidden_dim = hidden_dim or ((8 * self.d_model) // 3)
+        self.hidden_dim = hidden_dim
 
         self.gate_proj = torch.nn.Linear(self.d_model, self.hidden_dim, bias=False)
         self.a_up_proj = torch.nn.Linear(self.d_model, self.hidden_dim, bias=False)
@@ -41,7 +43,7 @@ class FFNOutput:
 
 
 class DenseFFN(torch.nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int | None = None, dropout: float = 0.0) -> None:
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.norm = torch.nn.LayerNorm(d_model)
         self.swiglu = SwiGLU(d_model=d_model, hidden_dim=hidden_dim)
@@ -142,73 +144,52 @@ class RoutingPlan:
 
     token_num: int
 
-# 介绍一下 GEMM, 通用矩阵乘法, 如果在 for 循环中计算很多个 Expert 会导致启动很多个计算 Kernel
-# 效率很差, 因此 Group GEMM 可以在 GPU Kernel 内部统一调度这些矩阵乘法提高效率,
-# Batched GEMM 通常要求每组矩阵乘法形状相同， 所有的 Expert 必须有相同的 Token 数量,
-# 但是 MoE 中每个 Expert 收到的 Token 数量通常不同, Grouped GEMM 可以处理不同的矩阵尺寸, 更适合 MoE.
-# ---
-# GEMM 是一次矩阵乘法；Grouped GEMM 是将多个 Expert 的、token 数可能不同的矩阵乘法统一提交和调度，从而减少小 kernel 启动开销并提高 GPU 利用率。
-class TopKSparseMoE(torch.nn.Module):
-    '''
-    Token Mask 的作用: TODO ...
-    '''
+class BaseTopKSparseMoE(torch.nn.Module, ABC):
     def __init__(
         self, 
         d_model: int,
         config: MoEConfig,
-        hidden_dim: int | None = None,
+        hidden_dim: int,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-
         self.d_model = d_model
+        self.d_hidden = hidden_dim
         self.config = config
 
         # shared pre-norm
         self.norm = torch.nn.LayerNorm(d_model)
         # Top-K router
         self.router = TopKRouter(d_model=self.d_model, config=self.config)
-        # experts
-        self.experts = torch.nn.ModuleList([
-            SwiGLU(d_model=self.d_model, hidden_dim=hidden_dim)
-            for _ in range(config.expert_num)
-        ])
         # shared dropout
         self.dropout = torch.nn.Dropout(dropout)
 
-    def forward(
-        self,
+    @abstractmethod
+    def forward(self,
         x: torch.Tensor, # [B, L, D]
         token_mask: torch.Tensor | None = None, # [B, L]
     ) -> FFNOutput:
-        assert x.ndim == 3
-        batch_size, sequence_length, d_model = x.shape
-        assert d_model == self.d_model
+        raise NotImplementedError
 
-        # Token Mask
-        token_mask = token_mask if token_mask is not None else torch.ones(batch_size, sequence_length)
-        assert token_mask.shape == (batch_size, sequence_length)
-        token_mask = token_mask.to(dtype=torch.bool, device=x.device)
+    def _combine_sorted_output(
+        self,
+        sorted_output: torch.Tensor,
+        routing_plan: RoutingPlan,
+    ) -> torch.Tensor:
+        sorted_weights = routing_plan.sorted_weights.to(dtype=sorted_output.dtype)
+        weighted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
-        # Normalize and Flatten
-        normalized_x = self.norm(x)
-        # [B, L, D] -> [B * L, D]
-        flat_x: torch.Tensor = normalized_x.reshape(batch_size * sequence_length, self.d_model)
-        flat_mask: torch.Tensor = token_mask.reshape(-1)
+        valid_output = weighted_output.new_zeros(routing_plan.token_num, self.d_model)
+        valid_output.index_add_(dim=0, index=routing_plan.sorted_token_indices, source=weighted_output)
+        return valid_output
 
-        # 避免把 PAD token 送入 Router,
-        # 影响 tokens_per_expert/probability_per_expert/auxiliary loss/z-loss
-        valid_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)
-        if valid_indices.numel() == 0:
-            raise ValueError("TopKSparseMoE requires at least one valid token")
-        # [T, D]
-        valid_x = flat_x.index_select(dim=0, index=valid_indices)
-
-        # [T, K], [T, K]
-        router_output: RouterOutput = self.router(valid_x)
-
-        ### Spec ---------- Expert Major, Router Table
-
+    def _build_routing_plan(
+        self,
+        valid_x: torch.Tensor,
+        router_output: RouterOutput
+    ) -> tuple[torch.Tensor, RoutingPlan]:
+        '''拆分出来根据 valid_x 构造 RoutingPlan 的过程, 涉及到排序和选择性的 Padding Contiguous-Offset
+        RoutingPlan 表示 sorted Expert-Major 布局逻辑'''
         token_num, top_k = router_output.expert_indices.shape
         route_token_indices = (
             torch.arange(token_num, device=valid_x.device)
@@ -236,20 +217,70 @@ class TopKSparseMoE(torch.nn.Module):
             tokens_per_expert.new_zeros(1),
             tokens_per_expert.cumsum(dim=0),
         ])
-        ### Spec ---------- Expert Major, Router Table
+
+        return sorted_x, RoutingPlan(
+            sorted_token_indices=sorted_token_indices,
+            sorted_expert_indices=sorted_expert_indices,
+            sorted_weights=sorted_weight,
+            tokens_per_expert=tokens_per_expert,
+            expert_offsets=expert_offsets,
+            token_num=valid_x.shape[0],
+        )
+
+
+# 介绍一下 GEMM, 通用矩阵乘法, 如果在 for 循环中计算很多个 Expert 会导致启动很多个计算 Kernel
+# 效率很差, 因此 Group GEMM 可以在 GPU Kernel 内部统一调度这些矩阵乘法提高效率,
+# Batched GEMM 通常要求每组矩阵乘法形状相同， 所有的 Expert 必须有相同的 Token 数量,
+# 但是 MoE 中每个 Expert 收到的 Token 数量通常不同, Grouped GEMM 可以处理不同的矩阵尺寸, 更适合 MoE.
+# ---
+# GEMM 是一次矩阵乘法；Grouped GEMM 是将多个 Expert 的、token 数可能不同的矩阵乘法统一提交和调度，从而减少小 kernel 启动开销并提高 GPU 利用率。
+class TopKSparseMoE(BaseTopKSparseMoE):
+    def __init__(
+        self, 
+        d_model: int,
+        config: MoEConfig,
+        hidden_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(d_model, config, hidden_dim, dropout)
+        # experts
+        self.experts = torch.nn.ModuleList([
+            SwiGLU(d_model=self.d_model, hidden_dim=hidden_dim)
+            for _ in range(config.expert_num)
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor, # [B, L, D]
+        token_mask: torch.Tensor | None = None, # [B, L]
+    ) -> FFNOutput:
+        assert x.ndim == 3
+        batch_size, sequence_length, d_model = x.shape
+        assert d_model == self.d_model
+
+        # Token Mask
+        token_mask = token_mask if token_mask is not None else torch.ones(batch_size, sequence_length)
+        assert token_mask.shape == (batch_size, sequence_length)
+        token_mask = token_mask.to(dtype=torch.bool, device=x.device)
+
+        # Normalize and Flatten
+        normalized_x = self.norm(x)
+        # [B, L, D] -> [B * L, D]
+        flat_x: torch.Tensor = normalized_x.reshape(batch_size * sequence_length, self.d_model)
+        flat_mask: torch.Tensor = token_mask.reshape(-1)
+
+        # 避免把 PAD token 送入 Router,
+        # 影响 tokens_per_expert/probability_per_expert/auxiliary loss/z-loss
+        valid_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            raise ValueError("TopKSparseMoE requires at least one valid token")
+        valid_x = flat_x.index_select(dim=0, index=valid_indices) # [T, D]
+
+        router_output: RouterOutput = self.router(valid_x)
+        sorted_x, routing_plan = self._build_routing_plan(valid_x, router_output)
 
         # valid_output = self._dispatch_v1(valid_x=valid_x, router_output=router_output)
-        valid_output = self._dispatch_v2(
-            sorted_x=sorted_x,
-            routing_plan=RoutingPlan(
-                sorted_token_indices=sorted_token_indices,
-                sorted_expert_indices=sorted_expert_indices,
-                sorted_weights=sorted_weight,
-                tokens_per_expert=tokens_per_expert,
-                expert_offsets=expert_offsets,
-                token_num=valid_x.shape[0],
-            )
-        )
+        valid_output = self._dispatch_v2(sorted_x=sorted_x, routing_plan=routing_plan)
 
         # valid_output 中只记录了 mask 之后不包含 PAD 的有效 token,
         # 需要把有效 token 映射回原本的总 token 空间中.
@@ -268,10 +299,10 @@ class TopKSparseMoE(torch.nn.Module):
         )
 
     def _dispatch_v1(
-            self,
-            valid_x: torch.Tensor,
-            router_output: RouterOutput,
-        ) -> torch.Tensor:
+        self,
+        valid_x: torch.Tensor,
+        router_output: RouterOutput,
+    ) -> torch.Tensor:
         # build buffer for experts' output, shape is [T, D]
         # 累加所有 Expert 的加权结果
         valid_output = torch.zeros_like(valid_x)
@@ -332,3 +363,158 @@ class TopKSparseMoE(torch.nn.Module):
         valid_output.index_add_(dim=0, index=routing_plan.sorted_token_indices, source=weighted_output)
         return valid_output
         
+class GEMM_TopKSparseMoE(BaseTopKSparseMoE):
+    def __init__(
+        self, 
+        d_model: int,
+        config: MoEConfig,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        use_grouped_gemm: bool = True,
+    ) -> None:
+        super().__init__(d_model, config, hidden_dim, dropout)
+        self.use_grouped_gemm = use_grouped_gemm
+        # Packed Expert Weights
+        self.gate_up_weight = torch.nn.Parameter(
+            torch.empty(config.expert_num, d_model, 2 * hidden_dim)
+        )
+        self.down_weight = torch.nn.Parameter(
+            torch.empty(config.expert_num, hidden_dim, d_model)
+        )
+        self._reset_parameters() # 初始化权重参数
+
+    def _reset_parameters(self) -> None:
+        gate_up_bound = 1.0 / math.sqrt(self.d_model)
+        down_bound = 1.0 / math.sqrt(self.d_hidden)
+        torch.nn.init.uniform_(self.gate_up_weight, -gate_up_bound, gate_up_bound)
+        torch.nn.init.uniform_(self.down_weight, -down_bound, down_bound)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ) -> FFNOutput:
+        assert x.ndim == 3
+        batch_size, sequence_length, d_model = x.shape
+        assert d_model == self.d_model
+
+        # Token Mask
+        token_mask = token_mask if token_mask is not None else torch.ones(batch_size, sequence_length)
+        assert token_mask.shape == (batch_size, sequence_length)
+        token_mask = token_mask.to(dtype=torch.bool, device=x.device)
+
+        # Normalize and Flatten
+        normalized_x = self.norm(x)
+        flat_x: torch.Tensor = normalized_x.reshape(batch_size * sequence_length, self.d_model)
+        flat_mask: torch.Tensor = token_mask.reshape(-1)
+
+        valid_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            raise ValueError("TopKSparseMoE requires at least one valid token")
+        valid_x = flat_x.index_select(dim=0, index=valid_indices)
+
+        router_output: RouterOutput = self.router(valid_x)
+        # 当前每个 Expert 中包含的 token 数量不同, token_per_expert 不同
+        sorted_x, routing_plan = self._build_routing_plan(valid_x, router_output)
+
+        sorted_output = (
+            self._experts_batched(sorted_x, routing_plan) # [T * K, D]
+            if not self.use_grouped_gemm
+            else self._experts_grouped(sorted_x, routing_plan)
+        )
+
+        valid_output = self._combine_sorted_output(sorted_output, routing_plan) # [T, D]
+
+        flat_output = torch.zeros_like(flat_x)
+        flat_output = flat_output.index_copy(dim=0, index=valid_indices, source=valid_output)
+        output = flat_output.reshape(batch_size, sequence_length, self.d_model)
+        output = self.dropout(output)
+
+        return FFNOutput(
+            hidden_states=output,
+            aux_loss=router_output.aux_loss,
+            z_loss=router_output.z_loss,
+            router_stats=router_output.stats,
+        )
+
+    def _experts_batched(self, sorted_x: torch.Tensor, routing_plan: RoutingPlan) -> torch.Tensor:
+        # 取出单个 expert 消费最多的 token 数量
+        capacity = routing_plan.tokens_per_expert.max().item()
+
+        # 每个 Token 有 Top-K 条路由, 总的路由数量为 T * K
+        route_num = sorted_x.shape[0]
+        expert_ids = routing_plan.sorted_expert_indices
+        # 先获得每个 Expert 排序之后第一次出现的位置
+        expert_start_per_route = (
+            routing_plan.expert_offsets[:-1]
+            .index_select(dim=0, index=expert_ids)
+        )
+        # 然后为发送给 Expert 的 Token 设置一个位置, 先是在 Expert 内部的位置
+        local_positions = ( # [T * K]
+            torch.arange(route_num, device=sorted_x.device)
+            - expert_start_per_route
+        )
+        # 然后根据 Expert 第一次出现的位置和 Token 在 Expert 内的位置, 把位置广播到全局
+        # 对应 [E, C, D] -> 第几个 Expert, 每个 Expert 有 Capacity 个 Token, 选择第几个 Token
+        flat_positions = (expert_ids * capacity) + local_positions
+
+        # 构造 Padded X, [E * C, D]
+        padded_flat: torch.Tensor = sorted_x.new_zeros((self.config.expert_num * capacity, self.d_model))
+        # 根据 flat_positions 把 sorted_x 中的 token 放到 padded_flat 中
+        padded_flat = padded_flat.index_copy_(dim=0, index=flat_positions, source=sorted_x)
+        # [E * C, D] -> [E, C, D]
+        padded_x = padded_flat.reshape(self.config.expert_num, capacity, self.d_model)
+        # 按照 SwiGLU 的实现, 计算 gate 和 up, 然后 down(silu(gate) * up)
+        gate_up = torch.bmm(padded_x, self.gate_up_weight)  # [E, C, 2H], gate & up
+        gate, up = gate_up.split([self.d_hidden, self.d_hidden], dim=-1)
+        hidden = F.silu(gate) * up # [E, C, H]
+        padded_output = torch.bmm(hidden, self.down_weight) # [E, C, D]
+
+        # 删去 Padded Token, 取出有效 Token
+        sorted_output = (
+            padded_output
+            .reshape(self.config.expert_num * capacity, self.d_model)
+            .index_select(dim=0, index=flat_positions)
+        )
+        return sorted_output
+
+    def _experts_grouped(self, sorted_x: torch.Tensor, routing_plan: RoutingPlan) -> torch.Tensor:
+        raise RuntimeError("Waiting for Impl...")
+
+@torch.no_grad()
+def load_gemm_from_eager(gemm_moe: GEMM_TopKSparseMoE, eager_moe: TopKSparseMoE) -> None:
+    assert eager_moe.config.expert_num == gemm_moe.config.expert_num
+    assert eager_moe.d_model == gemm_moe.d_model
+    assert eager_moe.d_hidden == gemm_moe.d_hidden
+
+    gemm_moe.norm.load_state_dict(eager_moe.norm.state_dict())
+    gemm_moe.router.load_state_dict(eager_moe.router.state_dict())
+
+    for expert_index, expert in enumerate(eager_moe.experts):
+        gemm_moe.gate_up_weight[expert_index, :, :gemm_moe.d_hidden,].copy_(
+            expert.gate_proj.weight.T
+        )
+        gemm_moe.gate_up_weight[expert_index, :, gemm_moe.d_hidden:,].copy_(
+            expert.a_up_proj.weight.T
+        )
+        gemm_moe.down_weight[expert_index].copy_(expert.a_down_proj.weight.T)
+
+@torch.no_grad()
+def load_eager_from_gemm(eager_moe: TopKSparseMoE, gemm_moe: GEMM_TopKSparseMoE) -> None:
+    assert eager_moe.config.expert_num == gemm_moe.config.expert_num
+    assert eager_moe.d_model == gemm_moe.d_model
+    assert eager_moe.d_hidden == gemm_moe.d_hidden
+    
+    eager_moe.norm.load_state_dict(gemm_moe.norm.state_dict())
+    eager_moe.router.load_state_dict(gemm_moe.router.state_dict())
+
+    # [E, D, H], [E, D, H]
+    gate_up_weight, a_up_proj = gemm_moe.gate_up_weight.split(
+        [gemm_moe.d_hidden, gemm_moe.d_hidden],
+        dim=-1,
+    )
+    for expert_index, expert in enumerate(eager_moe.experts):
+        expert.gate_proj.weight.copy_(gate_up_weight[expert_index].T)
+        expert.a_up_proj.weight.copy_(a_up_proj[expert_index].T)
+        expert.a_down_proj.weight.copy_(gemm_moe.down_weight[expert_index].T)
+    
