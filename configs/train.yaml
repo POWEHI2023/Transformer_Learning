@@ -1,0 +1,62 @@
+schema_version: 1
+
+model:
+  n_layers: 4
+  d_model: 128
+  dropout: 0.1
+  tie_embedding: true
+
+  attention:
+    kind: gqa # mha | mqa | gqa | mla, 目前还没有实现 MLA
+    backend: einsum # eager | einsum | sdpa | flash, 目前实现了 eager 和 einsum
+    n_heads: 4
+    n_kv_heads: 2 # 仅 GQA 使用
+    use_causal_mask: true
+    rope_base: 10000.0
+
+  ffn:
+    kind: moe # dense | moe
+    backend: gemm # eager | gemm, MoE 的实现分为 eager 和 gemm 后端
+    hidden_dim: 384
+
+    moe:
+      expert_num: 4
+      top_k: 2
+      use_z_loss: true
+
+    gemm:
+      mode: batched # batched | grouped, gemm 后端分为 Batched 和 Grouped
+
+training:
+  batch_size: 16
+  epochs: 3
+  learning_rate: 0.0003
+  context_length: 128
+  max_grad_norm: 1.0
+  moe_aux_loss_coeff: 0.001
+  moe_z_loss_coeff: 0.001
+
+dataset:
+  name: Salesforce/wikitext
+  config: wikitext-2-raw-v1
+  train_split: train
+  validation_split: validation
+
+tokenizer:
+  path: artifacts/tokenizer.json
+  padding_side: right
+
+runtime:
+  device: auto
+  dtype: float32
+  compile: false
+  seed: 42
+
+parallel:
+  strategy: single # single | ddp | fsdp | hybrid
+  data_parallel_size: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  expert_parallel_size: 1
+  sequence_parallel: false
+  communication_backend: nccl

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 from dataclasses import dataclass
-from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig
-from model.zattention import Attention
+from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig, GEMM_TopKSparseMoE
+from model.zattention import Attention, GroupQueryAttention
     
 
 @dataclass
@@ -26,15 +26,19 @@ class TransformerBlock(torch.nn.Module):
         super().__init__()
         assert d_model % n_heads == 0
         self.attn_norm = torch.nn.LayerNorm(d_model)
-        self.attn = Attention(n_heads=n_heads, d_model=d_model, use_causal_mask=use_causal_mask)    
+        # 目前 Attention 和 MQA、GQA 的 forward 输出接口不统一,
+        # TODO 统一所有 Attention 的输出接口.
+        # self.attn = Attention(n_heads=n_head, d_model=d_model, use_causal_mask=use_causal_mask) 
+        self.attn = GroupQueryAttention(d_model=d_model, n_head=n_heads, n_kv_head=n_heads // 2, use_causal_mask=use_causal_mask)
         self.attn_dropout = torch.nn.Dropout(dropout)
 
         self.ffn = (
-                TopKSparseMoE(
+                GEMM_TopKSparseMoE(
                     d_model,
                     config=moe_config,
                     hidden_dim=hidden_dim,
                     dropout=dropout,
+                    use_grouped_gemm=False,
                 )
                 if moe_config is not None
                 else DenseFFN(d_model=d_model, hidden_dim=hidden_dim, dropout=dropout)
@@ -48,7 +52,7 @@ class TransformerBlock(torch.nn.Module):
     ) -> TransformerBlockOutput:
         # in: [B, L, d_model], out: [B, L, d_model]
         y = self.attn_norm(x)
-        y, _, _ = self.attn(y, position_ids, attention_mask)
+        y, _ = self.attn(y, position_ids, attention_mask)
         y = self.attn_dropout(y)
         x = x + y
 
@@ -73,7 +77,7 @@ class Transformer(torch.nn.Module):
         vocab_size: int,
         n_layers: int,
         hidden_dim: int,
-        n_heads: int = 2,
+        n_heads: int = 4,
         d_model: int = 512,
         dropout: float = 0.0,
         use_causal_mask: bool = True,
@@ -109,7 +113,9 @@ class Transformer(torch.nn.Module):
         # [B, L, d_model] -> [B, L, vocab_size]
         self.lm_head = torch.nn.Linear(d_model, vocab_size, bias=False)
         # share weight
-        if tie_embedding and self.pad_token_id is None:
+        self.tie_embedding = tie_embedding
+        # if tie_embedding and self.pad_token_id is None:
+        if self.tie_embedding:
             self.lm_head.weight = self.token_embedding.weight
 
     def forward(

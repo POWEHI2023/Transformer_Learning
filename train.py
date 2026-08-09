@@ -176,6 +176,7 @@ def main() -> None:
     device = resolve_device()
     model.to(device)
 
+    # 先创建 Transformer 模型在创建 Optimizer, 在 Transformer 中可能会发生权重重绑定
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     global_step = 0
     best_validation_loss = float("inf")
