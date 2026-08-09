@@ -27,6 +27,7 @@ class AttentionConfig:
 
         if self.kind == "gqa":
             if self.n_kv_heads is None: raise ValueError("GQA requires n_kv_heads")
+            if self.n_kv_heads <= 0: raise ValueError("attention.n_kv_heads must be positive")
             if self.n_heads % self.n_kv_heads != 0: raise ValueError("n_heads must be divisible by n_kv_heads")
 
 @dataclass(frozen=True)

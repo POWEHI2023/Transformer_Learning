@@ -48,7 +48,8 @@ class BaseAttention(torch.nn.Module, ABC):
         elif _kind == "gqa":
             _iproj_odim = self.d_model + 2 * (self.n_kv_head * self.d_heads)
             self.n_kv_head = config.n_kv_heads  # Group number
-            self.head_per_group = self.n_heads // self.n_kv_head # KV number per group
+            # q head number for each kv head
+            self.head_per_group = self.n_heads // self.n_kv_head
         else:
             raise ValueError(f"Unsupported Attention kind: {_kind}")
         
@@ -78,7 +79,7 @@ class BaseAttention(torch.nn.Module, ABC):
         (k, v), past_length = self._resolve_past_key_value(k, v, batch_size, past_key_value)
         blocked_mask = self._build_blocked_mask(q, k, past_length, attention_mask)
 
-        _kind = self.attn_config
+        _kind = self.attn_config.kind
         if _kind in ["mha", "mqa"]:
             # [B, H_q, S_q, D] @ [B, H_kv, D, S_kv] -> [B, H, S_q, S_kv]
             s = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_heads)
@@ -96,8 +97,7 @@ class BaseAttention(torch.nn.Module, ABC):
 
         # Group Query Attention --- 当前还没有 MLA, 因此这里执行 GQA
         assert _kind == "gqa"
-
-        
+        raise RuntimeError("...")
 
     def _resolve_past_key_value(
         self,
@@ -116,6 +116,7 @@ class BaseAttention(torch.nn.Module, ABC):
             # [B, 1, S+T, d_head]
             k = torch.cat([cached_k, k], dim=-2)
             v = torch.cat([cached_v, v], dim=-2)
+        # k is RoPEd now, and we need causal mask and attention mask later
         else: past_length = 0
 
         return ((k, v), past_length)
@@ -215,227 +216,82 @@ class MultiQueryAttention(BaseAttention):
         super().__init__(d_model, config)
     
         
-class GroupQueryAttention(torch.nn.Module):
+class GroupQueryAttention(BaseAttention):
     def __init__(
         self,
         d_model: int,
-        n_head: int,
-        n_kv_head: int,
-        use_causal_mask: bool = True,
-        rope_base: float = 10_000.0,
+        config: AttentionConfig,
     ) -> None:
-        super().__init__()
-
-        assert n_kv_head > 0 and n_head > 0 and d_model > 0
-        assert d_model % n_head == 0
-        assert n_head % n_kv_head == 0
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_head = self.d_model // self.n_head
-        self.n_kv_head = n_kv_head
-        self.head_per_group = self.n_head // self.n_kv_head
-
-        self.use_causal_mask = use_causal_mask
-
-        self.kv_d_model = self.n_kv_head * self.d_head
-
-        self.input_proj = torch.nn.Linear(self.d_model, self.d_model + 2 * self.kv_d_model)
-        self.output_proj = torch.nn.Linear(self.d_model, self.d_model)
-
-        self.rope = RoPE(head_dim=self.d_head, base=rope_base)
+        if config.kind != "gqa" or not config.backend in ["eager", "einsum"]:
+            raise ValueError(
+                "GroupQueryAttention: AttentionConfig kind should be gqa:,"
+                f"but got {config.kind}:{config.backend}"
+            )
+        super().__init__(d_model, config)
 
     def forward(
         self,
-        x: torch.Tensor,    # [B, S, d_model]
+        x: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         *,
         past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        tuple[torch.Tensor, torch.Tensor] | None,
-    ]:
+    ) -> AttentionOutput:
         batch_size, sequence_length, d_model = x.shape
         assert d_model == self.d_model
 
-        qkv: torch.Tensor = self.input_proj(x) # [B, S, d_model + kv_d_model + kv_d_model]
-        q, k, v = qkv.split(
-            [self.d_model, self.kv_d_model, self.kv_d_model],
-            dim=-1,
-        )
+        q, k, v = self._preprocess_input(x, position_ids)
+        (k, v), past_length = self._resolve_past_key_value(k, v, batch_size, past_key_value)
+        blocked_mask = self._build_blocked_mask(q, k, past_length, attention_mask)
 
-        # [B, H, S, D]
-        q = q.view(batch_size, sequence_length, self.n_head, self.d_head).transpose(1, 2)
-        # [B, G, S, D]
-        k = k.view(batch_size, sequence_length, self.n_kv_head, self.d_head).transpose(1, 2)
-        v = v.view(batch_size, sequence_length, self.n_kv_head, self.d_head).transpose(1, 2)
+        if self.attn_config.backend == "eager":
+            local_outputs = []
+            for group_index in range(self.n_kv_head):
+                q_head_start = group_index * self.head_per_group
+                q_head_end = q_head_start + self.head_per_group
 
-        # append position for each position
-        q = self.rope(q, position_ids)
-        k = self.rope(k, position_ids)
+                # [B, HeadPerGroup, S, D]
+                q_local: torch.Tensor = q[:, q_head_start : q_head_end]
+                # [B, 1, HS + CS, D]
+                k_local: torch.Tensor = k[:, group_index : group_index + 1]
+                v_local: torch.Tensor = v[:, group_index : group_index + 1]
 
-        if past_key_value is not None:
-            # in this case, x can be chunked request, so the S uppon means chunked sequence length
-            # make chunked sequence length as `ChunkS`
+                # [B, HeadPerGroup, S, D] @ [B, 1, D, HS + CS] -> [B, HeadPerGroup, S, HS + CS]
+                s_local = q_local @ k_local.transpose(-2, -1) / math.sqrt(self.d_heads)
 
-            # [B, G, HistoryS, D]
-            k_cached, v_cached = past_key_value
-            assert k_cached.ndim == 4 and v_cached.ndim == 4
-            assert k_cached.shape == v_cached.shape
-            assert k_cached.shape[:2] == (batch_size, self.n_kv_head)
-            assert k_cached.shape[-1] == self.d_head
+                if blocked_mask is not None:
+                    s_local = s_local.masked_fill(blocked_mask, float("-inf"))
 
-            # History Sequence Length
-            past_length = k_cached.shape[2]
+                # [B, HeadPerGroup, S, HS + CS] @ [B, 1, HS + CS, D] -> [B, HeadPerGroup, S, D]
+                attention_weights = torch.softmax(s_local, dim=-1)
+                o_local = attention_weights @ v_local
+                local_outputs.append(o_local)
 
-            # [B, G, HistoryS + ChunkS, D]
-            k = torch.cat([k_cached, k], dim=-2)
-            v = torch.cat([v_cached, v], dim=-2)
-        # k is RoPEd now, and we need causal mask and attention mask later
-        else: past_length = 0
+            # [B, n_head, S, d_head]
+            o = torch.cat(local_outputs, dim=1)
+            o = o.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
 
-        q_len, k_len = q.shape[2], k.shape[2]
-        query_positions = past_length + torch.arange(q_len, device=q.device)
-        key_positions = torch.arange(k_len, device=q.device)
-
-        blocked_mask = (
-            key_positions[None, :] > query_positions[:, None]
-            if self.use_causal_mask
-            else None
-        )
-
-        if attention_mask is not None:
-            assert attention_mask.shape == (batch_size, k_len)
-            valid_keys = attention_mask.to(device=q.device, dtype=torch.bool)
-            if not valid_keys.any(dim=-1).all():
-                raise ValueError("Every sample must contain at least one valid key")
-
-            # [B, 1, 1, K_len]
-            attention_mask = ~attention_mask.to(device=q.device, dtype=torch.bool)[:, None, None, :]
-            blocked_mask = (
-                attention_mask  # [B, 1, 1, K_len]
-                if blocked_mask is None
-                else blocked_mask | attention_mask  # [B, 1, Q, K_len]
+            return AttentionOutput(
+                output=self.output_proj(o),
+                cached_key_value=(k, v) if use_cache else None,
             )
 
-        local_outputs = []
-        for group_index in range(self.n_kv_head):
-            q_head_start = group_index * self.head_per_group
-            q_head_end = q_head_start + self.head_per_group
-
-            # [B, HeadPerGroup, S, D]
-            q_local: torch.Tensor = q[:, q_head_start : q_head_end]
-            # [B, 1, HS + CS, D]
-            k_local: torch.Tensor = k[:, group_index : group_index + 1]
-            v_local: torch.Tensor = v[:, group_index : group_index + 1]
-
-            # [B, HeadPerGroup, S, D] @ [B, 1, D, HS + CS] -> [B, HeadPerGroup, S, HS + CS]
-            s_local = q_local @ k_local.transpose(-2, -1) / math.sqrt(self.d_head)
-
-            if blocked_mask is not None:
-                s_local = s_local.masked_fill(blocked_mask, float("-inf"))
-
-            # [B, HeadPerGroup, S, HS + CS] @ [B, 1, HS + CS, D] -> [B, HeadPerGroup, S, D]
-            attention_weights = torch.softmax(s_local, dim=-1)
-            o_local = attention_weights @ v_local
-            local_outputs.append(o_local)
-
-        # [B, n_head, S, d_head]
-        o = torch.cat(local_outputs, dim=1)
-        o = o.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
-
-        return self.output_proj(o), (k, v) if use_cache else None
-
-class GroupQueryAttention_V2(GroupQueryAttention):
-    '''
-    einsum 是一种用下标描述张量乘法、广播和归约的接口，让 GQA 的数学结构很清楚。
-    '''
-    def forward(
-        self,
-        x: torch.Tensor,    # [B, S, d_model]
-        position_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        *,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-        use_cache: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        tuple[torch.Tensor, torch.Tensor] | None,
-    ]:
-        batch_size, sequence_length, d_model = x.shape
-        assert d_model == self.d_model
-
-        qkv: torch.Tensor = self.input_proj(x) # [B, S, d_model + kv_d_model + kv_d_model]
-        q, k, v = qkv.split(
-            [self.d_model, self.kv_d_model, self.kv_d_model],
-            dim=-1,
-        )
-
-        # [B, H, S, D]
-        q = q.view(batch_size, sequence_length, self.n_head, self.d_head).transpose(1, 2)
-        # [B, G, S, D]
-        k = k.view(batch_size, sequence_length, self.n_kv_head, self.d_head).transpose(1, 2)
-        v = v.view(batch_size, sequence_length, self.n_kv_head, self.d_head).transpose(1, 2)
-
-        # append position for each position
-        q = self.rope(q, position_ids)
-        k = self.rope(k, position_ids)
-
-        if past_key_value is not None:
-            # in this case, x can be chunked request, so the S uppon means chunked sequence length
-            # make chunked sequence length as `ChunkS`
-
-            # [B, G, HistoryS, D]
-            k_cached, v_cached = past_key_value
-            assert k_cached.ndim == 4 and v_cached.ndim == 4
-            assert k_cached.shape == v_cached.shape
-            assert k_cached.shape[:2] == (batch_size, self.n_kv_head)
-            assert k_cached.shape[-1] == self.d_head
-
-            # History Sequence Length
-            past_length = k_cached.shape[2]
-
-            # [B, G, HistoryS + ChunkS, D]
-            k = torch.cat([k_cached, k], dim=-2)
-            v = torch.cat([v_cached, v], dim=-2)
-        # k is RoPEd now, and we need causal mask and attention mask later
-        else: past_length = 0
-
-        q_len, k_len = q.shape[2], k.shape[2]
-        query_positions = past_length + torch.arange(q_len, device=q.device)
-        key_positions = torch.arange(k_len, device=q.device)
-
-        blocked_mask = None
-        if self.use_causal_mask:
-            # [Q, K] -> [1, 1, 1, Q, K]
-            blocked_mask = (key_positions[None, :] > query_positions[:, None])[None, None, None, :, :]
-
-        if attention_mask is not None:
-            assert attention_mask.shape == (batch_size, k_len)
-            valid_keys = attention_mask.to(device=q.device, dtype=torch.bool)
-            if not valid_keys.any(dim=-1).all():
-                raise ValueError("Every sample must contain at least one valid key")
-
-            # [B, 1, 1, 1, K_len]
-            attention_mask = ~valid_keys[:, None, None, None, :]
-            # [B, 1, 1, Q, K_len]
-            blocked_mask = (
-                attention_mask
-                if blocked_mask is None
-                else blocked_mask | attention_mask
-            )
+        # Group Query Attention --- 支持另一个 backed 为 einsum
+        assert self.attn_config.backend == "einsum"
 
         # [B, G, R, Q, D]
-        q_grouped = q.reshape(batch_size, self.n_kv_head, self.head_per_group, sequence_length, self.d_head)
+        q_grouped = q.reshape(batch_size, self.n_kv_head, self.head_per_group, sequence_length, self.d_heads)
         # [B, G, R, Q, K]
         s = torch.einsum(
             "bgrqd,bgkd->bgrqk",
             q_grouped, k,
-        ) / math.sqrt(self.d_head)
+        ) / math.sqrt(self.d_heads)
 
         if blocked_mask is not None:
-            s = s.masked_fill(blocked_mask, float("-inf"))
+            # [Q, K] -> [1, Q, K] -> [1, Q, K]
+            # [B, 1, Q, K] -> [B, 1, 1, Q, K]
+            s = s.masked_fill(blocked_mask.unsqueeze(-3), float("-inf"))
 
         attention_weights = torch.softmax(s, dim=-1)
         # [B, G, R, Q, D]
@@ -444,10 +300,13 @@ class GroupQueryAttention_V2(GroupQueryAttention):
             attention_weights, v,
         )
 
-        output = output_grouped.view(batch_size, self.n_head, sequence_length, self.d_head)
-        output = output.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
+        o = output_grouped.view(batch_size, self.n_heads, sequence_length, self.d_heads)
+        o = o.transpose(1, 2).reshape(batch_size, sequence_length, self.d_model)
 
-        return self.output_proj(output), (k, v) if use_cache else None
+        return AttentionOutput(
+            output=self.output_proj(o),
+            cached_key_value=(k, v) if use_cache else None,
+        )
 
 class InferAttention_MLA(torch.nn.Module):
     pass
