@@ -310,3 +310,15 @@ class GroupQueryAttention(BaseAttention):
 
 class InferAttention_MLA(torch.nn.Module):
     pass
+
+
+def build_attention(
+    d_model: int,
+    config: AttentionConfig
+) -> MultiHeadAttention | MultiQueryAttention | GroupQueryAttention:
+    if config.kind == "mha": _module = MultiHeadAttention
+    elif config.kind == "mqa": _module = MultiQueryAttention
+    elif config.kind == "gqa": _module = GroupQueryAttention
+    else: raise ValueError(f"Unsupported Attention kind: {config.kind}")
+
+    return _module(d_model, config)

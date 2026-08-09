@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from dataclasses import dataclass
 from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig, GEMM_TopKSparseMoE
-from model.zattention import AttentionOutput, MultiHeadAttention, MultiQueryAttention, GroupQueryAttention
+from model.zattention import AttentionOutput, build_attention
 from configs.zconfig import AttentionConfig
 
 
@@ -36,7 +36,7 @@ class TransformerBlock(torch.nn.Module):
             use_causal_mask=use_causal_mask,
             rope_base=10_000.0,
         )
-        self.attn = GroupQueryAttention(d_model=d_model, config=_attn_config)
+        self.attn = build_attention(d_model=d_model, config=_attn_config)
         self.attn_dropout = torch.nn.Dropout(dropout)
 
         self.ffn = (
