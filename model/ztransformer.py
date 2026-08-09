@@ -3,8 +3,9 @@ from __future__ import annotations
 import torch
 from dataclasses import dataclass
 from model.zmoe import RouterStats, FFNOutput, DenseFFN, TopKSparseMoE, MoEConfig, GEMM_TopKSparseMoE
-from model.zattention import Attention, GroupQueryAttention
-    
+from model.zattention import MultiHeadAttention, AttentionOutput
+from configs.zconfig import AttentionConfig
+
 
 @dataclass
 class TransformerBlockOutput:
@@ -26,10 +27,16 @@ class TransformerBlock(torch.nn.Module):
         super().__init__()
         assert d_model % n_heads == 0
         self.attn_norm = torch.nn.LayerNorm(d_model)
-        # 目前 Attention 和 MQA、GQA 的 forward 输出接口不统一,
-        # TODO 统一所有 Attention 的输出接口.
-        # self.attn = Attention(n_heads=n_head, d_model=d_model, use_causal_mask=use_causal_mask) 
-        self.attn = GroupQueryAttention(d_model=d_model, n_head=n_heads, n_kv_head=n_heads // 2, use_causal_mask=use_causal_mask)
+        _attn_config = AttentionConfig(
+            kind="mha",
+            backend="eager",
+            n_heads=n_heads,
+            n_kv_heads=None,
+            use_packed_segment=False,
+            use_causal_mask=use_causal_mask,
+            rope_base=10_000.0,
+        )
+        self.attn = MultiHeadAttention(d_model=d_model, config=_attn_config)
         self.attn_dropout = torch.nn.Dropout(dropout)
 
         self.ffn = (
@@ -52,8 +59,8 @@ class TransformerBlock(torch.nn.Module):
     ) -> TransformerBlockOutput:
         # in: [B, L, d_model], out: [B, L, d_model]
         y = self.attn_norm(x)
-        y, _ = self.attn(y, position_ids, attention_mask)
-        y = self.attn_dropout(y)
+        y: AttentionOutput = self.attn(y, position_ids, attention_mask)
+        y = self.attn_dropout(y.output)
         x = x + y
 
         ffn_o: FFNOutput = self.ffn(x, token_mask=attention_mask)

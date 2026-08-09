@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Dict, Any
 
 import yaml
 
@@ -12,6 +12,7 @@ class AttentionConfig:
     backend: Literal["eager", "einsum", "sdpa", "flash"]
     n_heads: int
     n_kv_heads: int | None = None
+    use_packed_segment: bool = False
     use_causal_mask: bool = True
     rope_base: float = 10_000.0
 
@@ -95,9 +96,25 @@ class ModelConfig:
 
     attention: AttentionConfig
     ffn: FFNConfig
-    parallel: ParallelConfig | None
 
     def validate(self) -> None:
         if self.n_layers <= 0: raise ValueError("model.n_layers must be positive")
         self.attention.validate(self.d_model)
         self.ffn.validate()
+
+def load_model_config(config_path: str | Path) -> ModelConfig:
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(...)
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            raw_config = yaml.safe_load(file)
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid YAML config: {path}") from error
+
+def model_config_from_dict(
+    model_data: Mapping[str, Any],
+    parallel_data: Mapping[str, Any] | None = None,
+) -> ModelConfig:
+    ...

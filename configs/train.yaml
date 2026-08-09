@@ -11,6 +11,7 @@ model:
     backend: einsum # eager | einsum | sdpa | flash, 目前实现了 eager 和 einsum
     n_heads: 4
     n_kv_heads: 2 # 仅 GQA 使用
+    use_packed_segment: false
     use_causal_mask: true
     rope_base: 10000.0
 
