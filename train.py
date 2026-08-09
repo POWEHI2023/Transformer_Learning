@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -9,23 +7,16 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
-from model.mstore import save_model
+from model.mstore import record_model_config, save_model
 from model.ztransformer import Transformer, TransformerOutput
 from configs.zconfig import build_model_config
 from configs.zparser import parse_args
+from zlogger import log_configs
 
 IGNORE_INDEX = -100
 TOKENIZER_PATH = Path("artifacts/tokenizer.json")
 DATASET_NAME = "Salesforce/wikitext"
 DATASET_CONFIG = "wikitext-2-raw-v1"
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 # 从训练好的词表中加载 tokenizer
 def load_tokenizer(tokenizer_path: str) -> PreTrainedTokenizerFast:
@@ -95,7 +86,7 @@ def main() -> None:
     model_config = build_model_config(args)
 
     tokenizer = load_tokenizer(str(TOKENIZER_PATH))
-    tokenizer_sha256 = file_sha256(TOKENIZER_PATH)
+    
     dataset = load_dataset(DATASET_NAME, DATASET_CONFIG) \
         .filter(lambda record: bool(record["text"].strip()))
     collator = LMCollator(tokenizer=tokenizer, context_length=args.context_length)
@@ -129,76 +120,31 @@ def main() -> None:
 
     # 先创建 Transformer 模型在创建 Optimizer, 在 Transformer 中可能会发生权重重绑定
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    record_model_config(
+        tokenizer=tokenizer,
+        model_config=model_config,
+        args=args,
+        optimizer=optimizer,
+    )
     global_step = 0
     best_validation_loss = float("inf")
 
-    checkpoint_model_config = {
-        "vocab_size": len(tokenizer),
-        "pad_token_id": tokenizer.pad_token_id,
-        **asdict(model_config),
-    }
-    training_config = {
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "context_length": args.context_length,
-        "learning_rate": args.lr,
-        "moe_auxloss_coeff": args.moe_auxloss_coeff,
-        "moe_zloss_coeff": args.moe_zloss_coeff,
-        "max_grad_norm": 1.0,
-        "ignore_index": IGNORE_INDEX,
-        "optimizer": type(optimizer).__name__,
-    }
-    dataset_config = {
-        "name": DATASET_NAME,
-        "config": DATASET_CONFIG,
-        "train_split": "train",
-        "validation_split": "validation",
-        "empty_texts_filtered": True,
-    }
-    tokenizer_config = {
-        "path": str(TOKENIZER_PATH),
-        "sha256": tokenizer_sha256,
-        "vocab_size": len(tokenizer),
-        "pad_token_id": tokenizer.pad_token_id,
-        "bos_token_id": tokenizer.bos_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-        "unk_token_id": tokenizer.unk_token_id,
-        "padding_side": tokenizer.padding_side,
-    }
-
-    print(
-        f"training_config: device={device}, epochs={args.epochs}, "
-        f"steps_per_epoch={len(train_loader)}, batch_size={args.batch_size}, "
-        f"context_length={args.context_length}, lr={args.lr}"
+    log_configs(
+        model_config=model_config,
+        device=device,
+        epochs=args.epochs,
+        steps_per_epoch=len(train_loader),
+        batch_size=args.batch_size,
+        context_length=args.context_length,
+        learning_rate=args.lr,
+        trainable_parameters=sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
+        moe_aux_loss_coeff=args.moe_auxloss_coeff,
+        moe_z_loss_coeff=args.moe_zloss_coeff,
     )
-    print(
-        f"model_config: layers={model_config.n_layers}, d_model={model_config.d_model}, "
-        f"dropout={model_config.dropout}, tie_embedding={model_config.tie_embedding}, "
-        f"trainable_parameters={sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad):,}"
-    )
-    attention_config = model_config.attention
-    print(
-        f"attention_config: kind={attention_config.kind}, backend={attention_config.backend}, "
-        f"heads={attention_config.n_heads}, kv_heads={attention_config.n_kv_heads}, "
-        f"causal={attention_config.use_causal_mask}, "
-        f"packed_segment={attention_config.use_packed_segment}, rope_base={attention_config.rope_base}"
-    )
-    ffn_config = model_config.ffn
-    print(
-        f"ffn_config: kind={ffn_config.kind}, backend={ffn_config.backend}, "
-        f"hidden_dim={ffn_config.hidden_dim}"
-    )
-    if ffn_config.moe is not None:
-        moe_config = ffn_config.moe
-        print(
-            f"moe_config: experts={moe_config.expert_num}, top_k={moe_config.top_k}, "
-            f"use_z_loss={moe_config.use_z_loss}, "
-            f"aux_coeff={args.moe_auxloss_coeff}, z_coeff={args.moe_zloss_coeff}"
-        )
-        if ffn_config.gemm is not None:
-            print(f"gemm_config: mode={ffn_config.gemm.mode}")
-    else:
-        print("moe_config: disabled (using DenseFFN)")
 
     for epoch in range(args.epochs):
         model.train()
@@ -286,10 +232,6 @@ def main() -> None:
                 global_step=global_step,
                 validation_loss=average_loss,
                 best_validation_loss=best_validation_loss,
-                model_config=checkpoint_model_config,
-                training_config=training_config,
-                dataset_config=dataset_config,
-                tokenizer_config=tokenizer_config,
                 device=device,
             )
  
@@ -301,10 +243,6 @@ def main() -> None:
         global_step=global_step,
         validation_loss=average_loss,
         best_validation_loss=best_validation_loss,
-        model_config=checkpoint_model_config,
-        training_config=training_config,
-        dataset_config=dataset_config,
-        tokenizer_config=tokenizer_config,
         device=device,
     )
 
