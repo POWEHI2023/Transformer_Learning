@@ -184,7 +184,7 @@ def main() -> None:
                     print(f"router: {format_router_stats(_o)}")
 
         model.eval()
-        total_loss, total_aux_loss, total_z_loss = 0.0, 0.0, 0.0
+        total_lm_nll, total_aux_loss, total_z_loss = 0.0, 0.0, 0.0
         total_tokens, validation_batches = 0, 0
         with torch.no_grad():
             for batch in validation_loader:
@@ -200,37 +200,46 @@ def main() -> None:
                     ignore_index=IGNORE_INDEX,
                     reduction="sum",
                 )
-                loss = (
-                    lm_loss
-                    + args.moe_auxloss_coeff * _o.router_aux_loss
-                    + args.moe_zloss_coeff * _o.router_z_loss
-                )
-
-                total_loss += loss.item()
+                total_lm_nll += lm_loss.item()
                 total_aux_loss += _o.router_aux_loss.item()
                 total_z_loss += _o.router_z_loss.item()
                 total_tokens += (labels != IGNORE_INDEX).sum().item()
                 validation_batches += 1
-        average_loss = total_loss / total_tokens
+
+        if validation_batches == 0:
+            raise RuntimeError("Validation loader produced no batches")
+        if total_tokens == 0:
+            raise RuntimeError("Validation set contains no target tokens")
+
+        average_lm_loss = total_lm_nll / total_tokens
         average_aux_loss = total_aux_loss / validation_batches
         average_z_loss = total_z_loss / validation_batches
-        perplexity = torch.exp(torch.tensor(average_loss)).item()
+        validation_loss = (
+            average_lm_loss
+            + args.moe_auxloss_coeff * average_aux_loss
+            + args.moe_zloss_coeff * average_z_loss
+        )
+        perplexity = torch.exp(torch.tensor(average_lm_loss)).item()
         print(
             f"validation: epoch={epoch + 1}/{args.epochs}, "
-            f"average_loss={average_loss:.4f}, perplexity={perplexity:.4f}, "
+            f"loss={validation_loss:.4f}, lm_loss={average_lm_loss:.4f}, "
+            f"perplexity={perplexity:.4f}, "
             f"aux_loss={average_aux_loss:.4f}, z_loss={average_z_loss:.4f}, "
             f"tokens={total_tokens}"
         )
 
-        if average_loss < best_validation_loss:
-            best_validation_loss = average_loss
+        if validation_loss < best_validation_loss:
+            best_validation_loss = validation_loss
             save_model(
                 "artifacts/model_best.pt",
                 model=model,
                 optimizer=optimizer,
                 completed_epoch=epoch + 1,
                 global_step=global_step,
-                validation_loss=average_loss,
+                validation_loss=validation_loss,
+                validation_lm_loss=average_lm_loss,
+                validation_aux_loss=average_aux_loss,
+                validation_z_loss=average_z_loss,
                 best_validation_loss=best_validation_loss,
                 device=device,
             )
@@ -241,7 +250,10 @@ def main() -> None:
         optimizer=optimizer,
         completed_epoch=args.epochs,
         global_step=global_step,
-        validation_loss=average_loss,
+        validation_loss=validation_loss,
+        validation_lm_loss=average_lm_loss,
+        validation_aux_loss=average_aux_loss,
+        validation_z_loss=average_z_loss,
         best_validation_loss=best_validation_loss,
         device=device,
     )
