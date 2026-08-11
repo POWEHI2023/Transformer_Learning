@@ -8,16 +8,11 @@ def grouped_mm_fwd_kernel(
     b_ptr,          # [E, K, N]
     c_ptr,          # [R, N]
     offsets_ptr,    # [E]
-
     num_experts,
 
-    stride_am,
-    stride_ak,
-    stride_be,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_am, stride_ak,
+    stride_be, stride_bk, stride_bn,
+    stride_cm, stride_cn,
 
     K: tl.constexpr,
     N: tl.constexpr,
@@ -113,23 +108,8 @@ def grouped_mm_fwd_kernel(
                 )
 
                 # 从地址中加载数值, 并且 mask 掉无效值. 一般在边界才会有无效值.
-                a = tl.load(
-                    a_ptrs,
-                    mask=(
-                        (offs_m[:, None] < expert_m)
-                        & (current_k[None, :] < K)
-                    ),
-                    other=0.0,
-                )
-
-                b = tl.load(
-                    b_ptrs,
-                    mask=(
-                        (current_k[:, None] < K)
-                        & (offs_n[None, :] < N)
-                    ),
-                    other=0.0,
-                )
+                a = tl.load(a_ptrs, mask=((offs_m[:, None] < expert_m) & (current_k[None, :] < K)), other=0.0)
+                b = tl.load(b_ptrs,mask=((current_k[:, None] < K) & (offs_n[None, :] < N)), other=0.0)
 
                 # 累加结果.
                 accumulator += tl.dot(a, b)
@@ -153,14 +133,7 @@ def grouped_mm_fwd_kernel(
             Store: mask=True  → 把 accumulator 写入 C/ mask=False → 不执行写入.
             '''
             # 存储结果.
-            tl.store(
-                c_ptrs,
-                accumulator,
-                mask=(
-                    (offs_m[:, None] < expert_m)
-                    & (offs_n[None, :] < N)
-                ),
-            )
+            tl.store(c_ptrs, accumulator, mask=((offs_m[:, None] < expert_m) & (offs_n[None, :] < N)))
 
             # 循环执行下一个 Tile, NUM_SMS 表示启动的 persistent Triton program 数量.
             tile_id += NUM_SMS
@@ -203,9 +176,7 @@ def group_mm_forward(
     num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
 
     grouped_mm_fwd_kernel[(num_sms,)](
-        a,
-        b,
-        output,
+        a, b, output,
         offsets,
         expert_num,
 
@@ -237,3 +208,78 @@ def group_mm_forward(
     '''
 
     return output
+
+class GroupedMMFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b, offset):
+        ctx.save_for_backward(a, b, offset)
+        return group_mm_forward(a, b, offset)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        a, b, offsets = ctx.saved_tensors
+        # dA_e = dC_e @ B_e.T
+        # grad_output: [R,N]
+        # B.transpose: [E,N,K]
+        # offsets:     [E]
+
+        # 上游产生的梯度可能是非连续的, transpose 或切片视图.
+        grad_output = grad_output.contiguous()
+        grad_a = None
+        grad_b = None
+
+        import torch.nn.functional as F
+        if ctx.needs_input_grad[0]:
+            grad_a = F.grouped_mm(
+                grad_output,               # [R,N]
+                b.transpose(-2, -1),       # [E,N,K]
+                offs=offsets,
+            )                              # [R,K]
+
+        if ctx.needs_input_grad[1]:
+            # dB_e = A_e.T @ dC_e
+            grad_b = F.grouped_mm(
+                a.transpose(0, 1),  # [K,R]
+                grad_output,        # [R,N]
+                offs=offsets,
+            )                       # [E,K,N]
+
+        return grad_a, grad_b, None
+
+class GroupedMMFunction_Optim(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b, offset) -> torch.Tensor:
+        ctx.save_for_backward(a, b, offset)
+        return group_mm_forward(a, b, offset)
+
+    @staticmethod
+    def backward(ctx, grad_output) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        '''TODO 后续通过一个 Triton Kernel 计算 dB'''
+        a, b, offsets = ctx.saved_tensors
+        # dA_e = dC_e @ B_e.T
+        # dB_e = A_e.T @ dC_e -> 归约维度为可变维度 M_e: [K,M_e] @ [M_e,N] -> [K,N]
+
+        # 上游产生的梯度可能是非连续的, transpose 或切片视图.
+        grad_output = grad_output.contiguous()
+        grad_a = None
+        grad_b = None
+
+        # 变长 M_e 不是归约维度, 在矩阵行方向, 复用现有的 forward kernel.
+        # [R,K_in] @ [E,K_in,N_out] -> [R,N_out]
+        import torch.nn.functional as F
+        if ctx.needs_input_grad[0]:
+            grad_a = group_mm_forward(
+                grad_output,               # [R,N]
+                b.transpose(-2, -1),       # [E,N,K]
+                offsets,
+            )                              # [R,K]
+
+        # 归约维度变成了 M_e, 不能复用 group_mm_forward.
+        if ctx.needs_input_grad[1]:
+            grad_b = F.grouped_mm(
+                a.transpose(0, 1),  # [K,R]
+                grad_output,        # [R,N]
+                offs=offsets,
+            )                       # [E,K,N]
+
+        return grad_a, grad_b, None

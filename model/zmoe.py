@@ -471,12 +471,17 @@ class GEMM_TopKSparseMoE(BaseTopKSparseMoE):
         offs = routing_plan.expert_offsets[1:].to(dtype=torch.int32, device=sorted_x.device)
 
         # [T * K, D] [E, D, 2H] -> [T * K, 2H]
-        gate_up = F.grouped_mm(sorted_x, self.gate_up_weight, offs=offs)
+        # gate_up = F.grouped_mm(sorted_x, self.gate_up_weight, offs=offs)
+        from kernels.moe_gemm import GroupedMMFunction
+        gate_up = GroupedMMFunction.apply(sorted_x, self.gate_up_weight, offs)
+
         gate, up = gate_up.split(self.d_hidden, dim=-1)
         hidden = F.silu(gate) * up
 
         # [T * K, H] [E, H, D] -> [T * K, D]
-        sorted_output = F.grouped_mm(hidden, self.down_weight, offs=offs)
+        # sorted_output = F.grouped_mm(hidden, self.down_weight, offs=offs)
+        sorted_output = GroupedMMFunction.apply(hidden, self.down_weight, offs)
+
         return sorted_output
 
 @torch.no_grad()
