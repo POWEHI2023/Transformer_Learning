@@ -26,47 +26,85 @@ def grouped_mm_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    # 每个 program 相当于一个持久运行的 CTA
     tile_id = tl.program_id(0)
 
     problem_tile_start = 0
     row_start = 0
 
     for expert_id in range(num_experts):
+        # 获得 token 的结束位置
         row_end = tl.load(offsets_ptr + expert_id)
+        # 代表当前 expert 参与计算的 token 数量
         expert_m = row_end - row_start
 
+        # 当前专家分到的需要计算的 token 有 expert_m 个, 需要分 num_m_tiles 次计算.
         num_m_tiles = tl.cdiv(expert_m, BLOCK_M)
+        # 输出需要分 num_m_tiles 次计算.
         num_n_tiles = tl.cdiv(N, BLOCK_N)
+        # 输出矩阵共分成了 num_tiles 个小矩阵, 拼接后成为总的结果.
         num_tiles = num_m_tiles * num_n_tiles
 
+        # 每次计算总的结果中的一个小块.
+        # 当前专家输出 BLOCK 中包含的 tile 任务 id, 从 problem_tile_start 到 problem_tile_end.
+        # 这个输出 BLOCK 代表了一个专家需要的完整计算.
         problem_tile_end = problem_tile_start + num_tiles
 
-        # 当前 CTA 可能连续处理多个 tile
+        '''
+        假设当前需要计算的 token 数量为 6, 中间维度为 8, 输出维度为 6.
+        BLOCK_M = 3, BLOCK_K = 4, BLOCK_N = 3.
+        6 % BLOCK_M == 0, 8 % BLOCK_K == 0, 6 % BLOCK_N == 0.
+
+        A(m0,k0) = A[0:3, 0:4]  # [3,4]
+        A(m0,k1) = A[0:3, 4:8]  # [3,4]
+        A(m1,k0) = A[3:6, 0:4]  # [3,4]
+        A(m1,k1) = A[3:6, 4:8]  # [3,4]
+
+        B(k0,n0) = B[0:4, 0:3]  # [4,3]
+        B(k0,n1) = B[0:4, 3:6]  # [4,3]
+        B(k1,n0) = B[4:8, 0:3]  # [4,3]
+        B(k1,n1) = B[4:8, 3:6]  # [4,3]
+
+        tile_m = 1, tile_n = 0, 表示取 A 矩阵的第一组 token; 取 B 矩阵的第 0 组 输出特征列.
+        A 的第 1 组 为: [3:6, :], 分为连个 BLOCK_K 块, [3:6, 0:4], [3:6, 4:8].
+        B 的第 0 组 为: [:, 0:3], [0:4, 0:3], [4:8, 0:3].
+
+        根据 k_block 沿 K 维分成两次计算, [3:6, 0:4]x[0:4, 0:3], [3:6, 4:8]x[4:8, 0:3] -> [3:6, 0:3]
+        '''
         while tile_id >= problem_tile_start and tile_id < problem_tile_end:
+            # tile_id 减去当前专家包含的任务起始 id, 表示了当前专家中的第几个 tile 任务.
             local_tile_id = tile_id - problem_tile_start
 
+            # 计算第几块中的 token 参与计算. 输出小块中的下标 m.
             tile_m = local_tile_id // num_n_tiles
+            # 输出小块中的下标 n
             tile_n = local_tile_id % num_n_tiles
 
+            # 左矩阵的 row_id.
             offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            # 右矩阵的 col_id.
             offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
             offs_k = tl.arange(0, BLOCK_K)
 
+            # 在 FP32 中累加当前输出 tile 沿 K 维的部分乘积. [BLOCK_M, BLOCK_N]
             accumulator = tl.zeros(
                 (BLOCK_M, BLOCK_N),
                 dtype=tl.float32,
             )
 
+            # 中间维度可以分成几次计算.
             for k_block in range(0, tl.cdiv(K, BLOCK_K)):
+                # 当前计算的中间维度.
                 current_k = k_block * BLOCK_K + offs_k
 
+                # 一个一维内存空间, 根据起始指针访问 第'expert_id'个专家的第'offs_m'些 token, 第'current_k'些中间维度.
+                # a 输入的维度是 [R, K], 需要访问 [row_start + offs_m, current_k] 索引中的值.
                 a_ptrs = (
                     a_ptr
                     + (row_start + offs_m[:, None]) * stride_am
                     + current_k[None, :] * stride_ak
                 )
 
+                # 同理, b 权重矩阵是 [E, K, N], 所以直接根据索引 [expert_id, current_k, offs_n] 访问内存空间.
                 b_ptrs = (
                     b_ptr
                     + expert_id * stride_be
@@ -74,6 +112,7 @@ def grouped_mm_fwd_kernel(
                     + offs_n[None, :] * stride_bn
                 )
 
+                # 从地址中加载数值, 并且 mask 掉无效值. 一般在边界才会有无效值.
                 a = tl.load(
                     a_ptrs,
                     mask=(
@@ -92,14 +131,28 @@ def grouped_mm_fwd_kernel(
                     other=0.0,
                 )
 
+                # 累加结果.
                 accumulator += tl.dot(a, b)
 
+            # 存储结果的地址.
             c_ptrs = (
                 c_ptr
                 + (row_start + offs_m[:, None]) * stride_cm
                 + offs_n[None, :] * stride_cn
             )
 
+            '''
+            mask 决定哪些地址真的从显存读取和哪些地址真的写入显存.
+            它主要用来处理最后一个 tile 不足 BLOCK_M/BLOCK_N/BLOCK_K 的情况，避免越界访问.
+
+            Load: mask=True  → 从对应地址读取/ mask=False → 不访问对应地址, 返回 other. other=0.0 不影响累加结果.
+                [:, None] 约束行, [None, :] 约束列.
+                行, offs_m = [64,65,...,127], 但当前 Expert 只有70行, offs_m < expert_m -> 64～69  → True/ 70～127 → False.
+                列同理, 广播之后屏蔽行列中为 False 的值为 other.
+            
+            Store: mask=True  → 把 accumulator 写入 C/ mask=False → 不执行写入.
+            '''
+            # 存储结果.
             tl.store(
                 c_ptrs,
                 accumulator,
@@ -109,6 +162,7 @@ def grouped_mm_fwd_kernel(
                 ),
             )
 
+            # 循环执行下一个 Tile, NUM_SMS 表示启动的 persistent Triton program 数量.
             tile_id += NUM_SMS
 
         problem_tile_start = problem_tile_end
@@ -116,7 +170,7 @@ def grouped_mm_fwd_kernel(
 
 '''
 R = T * TopK
-a: T * K 个 Token
+a: R 个 Token
 b: 所有 Expert 的权重打包之后的三维张量 [E, D, N]
 D: 输入维度, N: 输入乘以权重之后的输出维度
 [M_e, D] @ [D, N] -> [M_e, N] -> Expert 中包含 M_e 个 Token
@@ -172,5 +226,14 @@ def group_mm_forward(
         num_warps=4,
         num_stages=3,
     )
+    '''
+    Tile 的含义: 把一个大矩阵乘法分成多个小矩阵乘法.
+    完整的 GEMM 计算是: [M_e, K] @ [K, N] = [M_e, N], M_e 代表专家收到的 token 数量, K 是规约维度, N 是输出维度.
+    把矩阵切成 BLOCK_M x BLOCK_N 的小块, 上述的 tile 大小为 [64, 64].
+
+    BLOCK_M: 一个 tile 最多处理多少行, 处理多少个路由 token. 一个 tile 最多计算 64 个 token 的输出.
+    BLOCK_N: 一个 tile 最多计算多少个输出特征.
+    BLOCK_K: 一个 tile 每次处理多少个规约维度. 输出的 tile 始终是 [BLOCK_M, BLOCK_N], 但是为了计算它需要沿 K 维反复累加.
+    '''
 
     return output
