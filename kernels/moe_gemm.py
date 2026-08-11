@@ -246,6 +246,102 @@ class GroupedMMFunction(torch.autograd.Function):
 
         return grad_a, grad_b, None
 
+# dB_e = A_e.T @ dC_e
+@triton.jit
+def grouped_mm_bwd_weight_kernel(
+    a_ptr,              # [R, K],
+    grade_output_ptr,   # [R, N]
+    grad_b_ptr,         # [E, K, N],
+    offsets_ptr,        # [E],
+
+    stride_ar, stride_ak,
+    stride_or, stride_on,
+    stride_be, stride_bk, stride_bn,
+
+    K: tl.constexpr,    # [K, R] @ [R, N]
+    N: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_k_tiles = tl.cdiv(K, BLOCK_K)
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    tiles_per_expert = num_k_tiles * num_n_tiles
+
+    expert_id = pid // tiles_per_expert
+    local_tile_id = pid % tiles_per_expert
+
+    tile_k = local_tile_id // num_n_tiles
+    tile_n = local_tile_id % num_n_tiles
+
+    row_end = tl.load(offsets_ptr + expert_id)
+    row_start = tl.load(
+        offsets_ptr + expert_id - 1,
+        mask=expert_id > 0,
+        other=0,
+    )
+    expert_m = row_end - row_start
+
+    offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    accumulator = tl.zeros(
+        (BLOCK_K, BLOCK_N),
+        dtype=tl.float32,
+    )
+
+    for r_start in range(0, expert_m, BLOCK_R):
+        offs_r = r_start + tl.arange(0, BLOCK_R)
+        # [R, K]
+        _a = (
+            a_ptr
+            + (row_start + offs_r[:, None]) * stride_ar
+            + offs_k[None, :] * stride_ak
+        )
+        a_block = tl.load(
+            _a,
+            mask=(
+                (offs_r[:, None] < expert_m)
+                & (offs_k[None, :] < K)
+            ),
+            other=0.0,
+        )
+
+        # [R, N]
+        _grade = (
+            grade_output_ptr
+            + (row_start + offs_r[:, None]) * stride_or
+            + offs_n[None, :] * stride_on
+        )
+        grade_block = tl.load(
+            _grade,
+            mask=(
+                (offs_r[:, None] < row_end)
+                & (offs_n[None, :] < N)
+            ),
+            other=0.0,
+        )
+
+        accumulator += tl.dot(a_block.T, grade_block)
+
+    # grad_b_ptr: [E, K, N]
+    _b = (
+        grad_b_ptr
+        + expert_id * stride_be
+        + offs_k[:, None] * stride_bk
+        + offs_n[None, :] * stride_bn
+    )
+    tl.store(
+        _b,
+        accumulator,
+        mask=(
+            (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        ),
+    )
+
 class GroupedMMFunction_Optim(torch.autograd.Function):
     @staticmethod
     def forward(ctx, a, b, offset) -> torch.Tensor:
