@@ -6,8 +6,8 @@ from __future__ import annotations
 import math
 import torch
 from abc import ABC, abstractmethod
-from model.zposition import RoPE
-from configs.zconfig import AttentionConfig
+from model.position.zposition import RoPE
+from configs.zconfig import AttentionConfig, ParallelConfig
 from dataclasses import dataclass
 
 @dataclass
@@ -20,6 +20,7 @@ class BaseAttention(torch.nn.Module, ABC):
         self,
         d_model: int,
         config: AttentionConfig,
+        parallel_config: ParallelConfig | None = None,
     ) -> None:
         super().__init__()
         config.validate(d_model)
@@ -52,13 +53,15 @@ class BaseAttention(torch.nn.Module, ABC):
             self.head_per_group = self.n_heads // self.n_kv_head
         else:
             raise ValueError(f"Unsupported Attention kind: {_kind}")
-        
+
+        self._iproj_odim = _iproj_odim
         self.input_proj = torch.nn.Linear(self.d_model, _iproj_odim)
         self.output_proj = torch.nn.Linear(self.d_model, self.d_model)
 
         self.rope = RoPE(head_dim=self.d_heads, base=config.rope_base)
 
         self.attn_config = config
+        self.parallel_config = parallel_config
 
     def forward(
         self,
@@ -75,7 +78,7 @@ class BaseAttention(torch.nn.Module, ABC):
         batch_size, sequence_length, d_model = x.shape
         assert d_model == self.d_model
         # X -> QKV, 并且为 QK 添加位置编码
-        q, k, v = self._preprocess_input(x, position_ids)
+        q, k, v = self._preprocess_input_local(x, position_ids)
         (k, v), past_length = self._resolve_past_key_value(k, v, batch_size, past_key_value)
         blocked_mask = self._build_blocked_mask(q, k, past_length, attention_mask)
 
@@ -128,6 +131,7 @@ class BaseAttention(torch.nn.Module, ABC):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, d_model = x.shape
         assert d_model == self.d_model
+
         qkv: torch.Tensor = self.input_proj(x)
 
         _split_shape = [self.d_model]
@@ -150,6 +154,55 @@ class BaseAttention(torch.nn.Module, ABC):
         k = self.rope(k, position_ids)
 
         return (q, k, v)
+
+    def _preprocess_input_local(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.parallel_config is None or self.parallel_config.tensor_parallel_size == 1:
+            return self._preprocess_input(x, position_ids)
+
+        batch_size, sequence_lengt, d_model = x.shape
+        assert d_model == self.d_model
+
+        # 总的 q heads 数量为 n_heads, 总的 kv heads 数量为 kv_heads.
+        # [B, S, D] -> [B, S, QKV_D]
+        qkv: torch.Tensor = self.input_proj(x)
+        local_width = qkv.shape[-1]
+        if self._iproj_odim % local_width != 0:
+            raise ValueError("")
+        _ratio = self._iproj_odim // local_width
+        local_q_heads = self.n_heads // _ratio
+        local_kv_heads = self.n_kv_head // _ratio
+        # local_width 中包含 local_q_heads + local_kv_heads 个 head, [B, S, local_width]
+        if local_width != (local_q_heads + local_kv_heads) * self.d_heads:
+            raise ValueError("")
+        if local_q_heads % local_kv_heads != 0:
+            raise ValueError("")
+        _cross_layout_ratio = local_q_heads // local_kv_heads
+        _cross_layout_d = (_cross_layout_ratio + 2) * self.d_heads
+        _cross_layout_n = local_width // _cross_layout_d
+        qkv = qkv.view(batch_size, sequence_lengt, _cross_layout_n, _cross_layout_d)
+        # [B, S, _cross_layout_n, _cross_layout_ratio]
+        # [B, S, _cross_layout_n, d_head]
+        # [B, S, _cross_layout_n, d_head]
+        q, k, v = qkv.split(
+            [_cross_layout_ratio * self.d_heads, self.d_heads, self.d_heads],
+            dim=-1,
+        )
+
+        # TODO 临时实现需要验证一下正确性 !!!!!!
+        q = q.reshape(batch_size, sequence_lengt, local_q_heads, self.d_heads)
+        k = k.reshape(batch_size, sequence_lengt, local_kv_heads, self.d_heads)
+        v = v.reshape(batch_size, sequence_lengt, local_kv_heads, self.d_heads)
+
+        q = self.rope(q)
+        k = self.rope(k)
+
+        return (q, k, v)
+        
+        
 
     def _build_blocked_mask(
         self,
@@ -307,9 +360,6 @@ class GroupQueryAttention(BaseAttention):
             output=self.output_proj(o),
             cached_key_value=(k, v) if use_cache else None,
         )
-
-class InferAttention_MLA(torch.nn.Module):
-    pass
 
 
 def build_attention(

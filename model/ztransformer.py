@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from dataclasses import dataclass
 from model.zmoe import RouterStats, FFNOutput, build_ffn
-from model.zattention import AttentionOutput, build_attention
+from model.attention.zattention import AttentionOutput, build_attention
 from configs.zconfig import ModelConfig
 
 

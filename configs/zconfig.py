@@ -86,6 +86,10 @@ class ParallelConfig:
     sequence_parallel: bool = False
     communication_backend: str = "nccl"
 
+    def validate(model_config: ModelConfig) -> None:
+        '''TODO 验证模型配置支持当前的并行模式'''
+        pass
+
 @dataclass(frozen=True)
 class ModelConfig:
     n_layers: int
