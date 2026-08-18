@@ -1,22 +1,41 @@
 from __future__ import annotations
 
-from .zattention import BaseAttention, AttentionConfig, AttentionOutput
+import torch
+from dataclasses import dataclass
 
-class MultiHead_LatenAttention(BaseAttention):
+@ dataclass
+class AttentionConfigPro:
+    pass
+
+@dataclass
+class MLAConfig:
+    q_lora_rank: int
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    value_head_dim: int
+
+    def __post_init__(self) -> None:
+        if self.qk_rope_head_dim % 2 != 0:
+            raise ValueError("")
+
+class MultiHead_LatenAttention(torch.nn.Module):
     '''
     Laten Attention 通过 c = Wx，qk -> Wqc 优化 KV 存储量的同时不引入额外计算开销(每次kv=Wc)
     但是 RoPE 情况下 cache 中的 c 需要改为 c + k^{rope}, 因为 RoPE Attention Score 类似 qk + {q_r}{k_r}.
     MLA 只是通过低秩压缩使复杂度从 O(Ld) 中的 d 降低, 从 2 * n_head * d_head -> d_c, 后续引出 Linear Attention.
+
+    KV Cache: c_kv[B, L, R_kv], k_rope[B, 1, L, D_r]
     '''
     def __init__(
         self,
         d_model: int,
-        config: AttentionConfig,
+        config: AttentionConfigPro,
     ) -> None:
-        super().__init__(d_model, config)
+        super().__init__()
         
 
-class LinearAttention(BaseAttention):
+class LinearAttention(torch.nn.Module):
     '''
     不再保存每个 token 的 KV, 普通 Softmax Attention: O = softmax(QK_T)V, 瓶颈在 QK_T,
     产生一个 LxL Attention Matrix, 复杂度为 O(L^2 x d), Decode 时单步计算复杂度 O(Ld), KV Cache 空间复杂度 O(Ld).
@@ -29,9 +48,9 @@ class LinearAttention(BaseAttention):
     def __init__(
         self,
         d_model: int,
-        config: AttentionConfig,
+        config: AttentionConfigPro,
     ) -> None:
-        super().__init__(d_model, config)
+        super().__init__()
 
 
 '''
