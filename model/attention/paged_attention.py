@@ -23,7 +23,48 @@ class PagedAttentionOutput:
     output: torch.Tensor
     seq_lens: torch.Tensor
 
+'''
+原先的 Shape: [B, Hkv, Q, D], 根据 Batch 构造缓存.
+Block 中是以 Token 为单位的: [N, P, Hkv, D] -> N 个 Block, 每个 Block 中最多 P 个 token,
+每个 token 被分成 Hkv 和 Head, 每个 Head 的维度是 D.
+例如: [100, 16, 2, 64], 一共 100 个物理块, 每个块保存 16 个 token, 使用 2 和 KV Head, 每个 Head 维度是 64.
+K 和 V 使用两块独立的存储:
+physical block 0
+├── token offset 0: [Hkv, D]
+├── token offset 1: [Hkv, D]
+├── ...
+└── token offset 15: [Hkv, D]
 
+physical block 1
+├── token offset 0: [Hkv, D]
+└── ...
+
+对于单个请求, 看到的是连续的逻辑 token, 0 1 2 3 4 5 6 7 8 9 ...
+可以为这些 token 划分连续的逻辑 Block, 但映射到物理上不一定连续, block_tables 就是逻辑到物理的映射.
+block_tables: [B, M], 行代表独立的请求, 列代表逻辑块到物理块的映射, -1 表示尚未分配物理块, 调换请求顺序时只需要调换其中的行.
+
+seq_lens: [B], 表示执行本次 Attention 前每个请求缓存了多少个 token.
+slot_mapping: [B, Q], 本次的每个请求中, 每个新 token 应该写入哪个物理 cache slot. slot = phy_block_id * block_size + block_off.
+
+
+-------------------------------
+PyTorch reference 通过 block_tables 将分页 KV 临时收集成 [B, Hkv, Kmax, D], valid_keys: [B, Kmax]
+然后把 Q 组织成统一的 Grouped Layout: [B, Hkv, R, Q, D], R = Hq // Hkv,
+接下来计算 einsum "bgrqd,bgkd->bgrqk", Q_goruped, K -> [B, Hkv, R, Q, Kmax],
+然后和 V 相乘: [B, Hkv, R, Q, Kmax] x [B, Hkv, Kmax, D] -> [B, Hkv, R, Q, D],
+合并 KV Group 和组内 Q head -> [B, Hq, Q, D], 最后合并 head -> [B, Q, d_model]
+
+padding_mask: valid_keys[b, k] = k < seq_lens[b] -> [B, Kmax]
+causal mask 根据绝对位置计算: 
+    query_position = past_seq_len + query_offset
+    blocked = key_position > query_position
+broadcast: [B, 1, 1, Q, Kmax]
+
+key_positions[None, None, None, None, :] # [1, 1, 1, 1, Kmax]
+query_positions[:, None, None, :, None] # [B, 1, 1, Q, 1]
+---
+真正高性能的 Triton/CUDA Paged Attention 不会执行完整 gather, 而是在 kernel 内直接计算避免 [B, Hkv, Kmax, D] 临时内存.
+'''
 @dataclass
 class PagedKVCache:
     """Preallocated physical storage used by paged attention.
