@@ -81,6 +81,7 @@ class ParallelConfig:
     strategy: str = "single"
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
+    context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1
     sequence_parallel: bool = False
