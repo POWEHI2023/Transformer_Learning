@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import math
-import torch
+import warnings
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+import torch
+
 from model.position.zposition import RoPE
 from configs.zconfig import AttentionConfig, ParallelConfig
-from dataclasses import dataclass
 
 @dataclass
 class AttentionOutput:
@@ -62,6 +65,12 @@ class BaseAttention(torch.nn.Module, ABC):
 
         self.attn_config = config
         self.parallel_config = parallel_config
+        if self.parallel_config is not None:
+            tp_size = self.parallel_config.tensor_parallel_size
+            if self.n_heads % tp_size != 0:
+                raise ValueError("")
+            if self.n_kv_head % tp_size != 0:
+                raise ValueError("")
 
     def forward(
         self,
@@ -78,7 +87,7 @@ class BaseAttention(torch.nn.Module, ABC):
         batch_size, sequence_length, d_model = x.shape
         assert d_model == self.d_model
         # X -> QKV, 并且为 QK 添加位置编码
-        q, k, v = self._preprocess_input_local(x, position_ids)
+        q, k, v = self._preprocess_input(x, position_ids)
         (k, v), past_length = self._resolve_past_key_value(k, v, batch_size, past_key_value)
         blocked_mask = self._build_blocked_mask(q, k, past_length, attention_mask)
 
@@ -160,6 +169,20 @@ class BaseAttention(torch.nn.Module, ABC):
         x: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Deprecated experimental prototype for parsing a local TP QKV layout.
+
+        This method assumes a special cross-interleaved local QKV layout.  It is
+        retained only as an experiment and must not be used by any Attention
+        forward path.  Production TP should be provided by the parallel layer
+        adapter instead.
+        """
+        warnings.warn(
+            "_preprocess_input_local() is a deprecated experimental prototype "
+            "and must not be used by Attention forward paths",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         if self.parallel_config is None or self.parallel_config.tensor_parallel_size == 1:
             return self._preprocess_input(x, position_ids)
 
@@ -173,10 +196,13 @@ class BaseAttention(torch.nn.Module, ABC):
         if self._iproj_odim % local_width != 0:
             raise ValueError("")
         _ratio = self._iproj_odim // local_width
+        if self.parallel_config is None or self.parallel_config.tensor_parallel_size != _ratio:
+            raise RuntimeError("")
+
         local_q_heads = self.n_heads // _ratio
         local_kv_heads = self.n_kv_head // _ratio
-        # local_width 中包含 local_q_heads + local_kv_heads 个 head, [B, S, local_width]
-        if local_width != (local_q_heads + local_kv_heads) * self.d_heads:
+        # local_width 中包含 local_q_heads + 2 * local_kv_heads 个 head, [B, S, local_width]
+        if local_width != (local_q_heads + 2 * local_kv_heads) * self.d_heads:
             raise ValueError("")
         if local_q_heads % local_kv_heads != 0:
             raise ValueError("")
@@ -192,17 +218,14 @@ class BaseAttention(torch.nn.Module, ABC):
             dim=-1,
         )
 
-        # TODO 临时实现需要验证一下正确性 !!!!!!
-        q = q.reshape(batch_size, sequence_lengt, local_q_heads, self.d_heads)
-        k = k.reshape(batch_size, sequence_lengt, local_kv_heads, self.d_heads)
-        v = v.reshape(batch_size, sequence_lengt, local_kv_heads, self.d_heads)
+        q = q.reshape(batch_size, sequence_lengt, local_q_heads, self.d_heads).transpose(1, 2)
+        k = k.reshape(batch_size, sequence_lengt, local_kv_heads, self.d_heads).transpose(1, 2)
+        v = v.reshape(batch_size, sequence_lengt, local_kv_heads, self.d_heads).transpose(1, 2)
 
-        q = self.rope(q)
-        k = self.rope(k)
+        q = self.rope(q, position_ids)
+        k = self.rope(k, position_ids)
 
         return (q, k, v)
-        
-        
 
     def _build_blocked_mask(
         self,
@@ -274,13 +297,14 @@ class GroupQueryAttention(BaseAttention):
         self,
         d_model: int,
         config: AttentionConfig,
+        parallel_config: ParallelConfig | None = None,
     ) -> None:
         if config.kind != "gqa" or not config.backend in ["eager", "einsum"]:
             raise ValueError(
                 "GroupQueryAttention: AttentionConfig kind should be gqa:,"
                 f"but got {config.kind}:{config.backend}"
             )
-        super().__init__(d_model, config)
+        super().__init__(d_model, config, parallel_config)
 
     def forward(
         self,
