@@ -119,28 +119,17 @@ class PagedKVCache:
         )
 
     @property
-    def num_blocks(self) -> int:
-        return self.key_cache.shape[0]
-
+    def num_blocks(self) -> int: return self.key_cache.shape[0]
     @property
-    def block_size(self) -> int:
-        return self.key_cache.shape[1]
-
+    def block_size(self) -> int: return self.key_cache.shape[1]
     @property
-    def n_kv_heads(self) -> int:
-        return self.key_cache.shape[2]
-
+    def n_kv_heads(self) -> int: return self.key_cache.shape[2]
     @property
-    def head_dim(self) -> int:
-        return self.key_cache.shape[3]
-
+    def head_dim(self) -> int: return self.key_cache.shape[3]
     @property
-    def device(self) -> torch.device:
-        return self.key_cache.device
-
+    def device(self) -> torch.device: return self.key_cache.device
     @property
-    def dtype(self) -> torch.dtype:
-        return self.key_cache.dtype
+    def dtype(self) -> torch.dtype: return self.key_cache.dtype
 
     def _validate_block_tables(self, block_tables: torch.Tensor, batch_size: int) -> None:
         if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
@@ -310,10 +299,6 @@ class BasePagedAttention(torch.nn.Module, ABC):
     The implementation supports continuous batching because physical cache
     storage has no active-batch dimension.  ``block_tables`` and ``seq_lens``
     describe only the requests participating in the current model invocation.
-
-    The current implementation is an eager PyTorch reference.  It demonstrates
-    cache allocation contracts and numerical behavior, but it is not yet a
-    fused high-performance paged-attention kernel.
     """
 
     def __init__(
@@ -325,8 +310,11 @@ class BasePagedAttention(torch.nn.Module, ABC):
     ) -> None:
         super().__init__()
         config.validate(d_model)
-        if n_kv_heads <= 0 or config.n_heads % n_kv_heads != 0:
-            raise ValueError("n_kv_heads must be positive and divide n_heads")
+        n_kv_heads = (
+            config.n_kv_heads
+            if config.n_kv_heads is not None
+            else config.n_heads
+        )
 
         self.d_model = d_model
         self.n_heads = config.n_heads
@@ -361,6 +349,7 @@ class BasePagedAttention(torch.nn.Module, ABC):
             dtype=parameter.dtype if dtype is None else dtype,
         )
 
+    # QKV Project 的逻辑和 Batch-Wise 实现一样
     def _project_qkv(
         self,
         x: torch.Tensor,
@@ -385,24 +374,28 @@ class BasePagedAttention(torch.nn.Module, ABC):
     def _masked_softmax(scores: torch.Tensor, blocked_mask: torch.Tensor) -> torch.Tensor:
         """Softmax that returns zeros, rather than NaNs, for fully masked rows."""
 
+        # float32 提升 softmax 的数值稳定性
         scores_float = scores.float().masked_fill(blocked_mask, torch.finfo(torch.float32).min)
         weights = torch.softmax(scores_float, dim=-1)
+        # 强制将屏蔽值清零
         weights = weights.masked_fill(blocked_mask, 0.0)
+        # 概率和, 0 or 1
         denominator = weights.sum(dim=-1, keepdim=True)
+        # 重新归一化, 对于至少存在一个有效 Key 的行保证有效位置概率和重新变成 1, 对于完全没有有效 Key 的行保留原来的全零结果
         weights = torch.where(denominator > 0, weights / denominator.clamp_min(1e-20), weights)
-        return weights.to(scores.dtype)
+        return weights.to(scores.dtype) # 转回原来的 dtype
 
     def _compute_attention(
         self,
-        q: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        valid_keys: torch.Tensor,
-        past_seq_lens: torch.Tensor,
-        query_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q: torch.Tensor, # [B, Hq, Q, D]
+        key: torch.Tensor, # [B, Hkv, Kmax, D] KV Cache 中 gather 出来完整的 Key, 高效的算子实现直接从 Block Table 中读取 KV
+        value: torch.Tensor, # [B, Hkv, Kmax, D] 不同请求的 KV 长度不同, 都补齐到 Kmax 方便 GEMM 计算
+        valid_keys: torch.Tensor, # [B, Kmax] 补齐到 Kmax 时会加入无效的 PAD Key, 区分哪些位置是有效 Key
+        past_seq_lens: torch.Tensor, # [B] 本次请求开始前, KV Cache 中已经存在的 token 数量, 用于计算本次 Query 的绝对位置
+        query_lens: torch.Tensor, # [B] 每个请求有多少个有效 Query token
+    ) -> tuple[torch.Tensor, torch.Tensor]: # [B, Q, d_model], [B, Q]
         batch_size, _, query_length, _ = q.shape
-        key_length = key.shape[2]
+        key_length = key.shape[2] # Kmax
 
         # Treat every KV head and its associated Q heads as one group.  For
         # MHA R=1, for MQA G=1, and for GQA both G and R can be greater than 1.
@@ -414,22 +407,30 @@ class BasePagedAttention(torch.nn.Module, ABC):
             self.head_dim,
         )
         scores = torch.einsum("bgrqd,bgkd->bgrqk", q_grouped, key)
+        # [B, Hkv, R, Q, D] @ [B, Hkv, K, D] -> [B, Hkv, R, Q, K]
         scores = scores / math.sqrt(self.head_dim)
 
         key_positions = torch.arange(key_length, device=q.device, dtype=torch.long)
         query_offsets = torch.arange(query_length, device=q.device, dtype=torch.long)
+        # 得到每个 Query 的 position ids, [B, Q]
         query_positions = past_seq_lens.to(torch.long)[:, None] + query_offsets[None, :]
+        # 屏蔽 Padded Query Token, True 为有效, [B, Q]
         valid_queries = query_offsets[None, :] < query_lens.to(torch.long)[:, None]
 
+        # [B, 1, 1, 1, K]
         blocked = ~valid_keys[:, None, None, None, :]
         if self.use_causal_mask:
             causal = key_positions[None, None, None, None, :] > query_positions[
                 :, None, None, :, None
             ]
+            # [B, 1, 1, 1, K] | [B, 1, 1, Q, K]
             blocked = blocked | causal
+        # [B, 1, 1, Q, K] | [B, 1, 1, Q, 1]
         blocked = blocked | ~valid_queries[:, None, None, :, None]
 
+        # 在 score 上应用安全 softmax
         weights = self._masked_softmax(scores, blocked)
+        # 执行 score @ v, [B, Hkv, R, Q, K] @ [B, Hkv, K, D] -> [B, Hkv, R, Q, D]
         output = torch.einsum("bgrqk,bgkd->bgrqd", weights, value)
         output = output.reshape(batch_size, self.n_heads, query_length, self.head_dim)
         output = output.transpose(1, 2).reshape(batch_size, query_length, self.d_model)
@@ -438,16 +439,15 @@ class BasePagedAttention(torch.nn.Module, ABC):
     def forward(
         self,
         x: torch.Tensor,
-        kv_cache: PagedKVCache,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
+        kv_cache: PagedKVCache, # KV Cache
+        block_tables: torch.Tensor, # 根据请求构造的 Block Table
+        seq_lens: torch.Tensor, # 每个请求的实际长度
         *,
         position_ids: torch.Tensor | None = None,
         query_lens: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
     ) -> PagedAttentionOutput:
-        """Append K/V to the paged cache and attend over each request.
-
+        """
         Args:
             x: New hidden states with shape [B, Q, d_model].
             kv_cache: Global physical cache shared by all active requests.
@@ -509,8 +509,14 @@ class BasePagedAttention(torch.nn.Module, ABC):
         elif position_ids.device != x.device:
             position_ids = position_ids.to(x.device)
 
+        # ------------------- 开始正式的 forward -------------------
+
         q, key, value = self._project_qkv(x, position_ids)
 
+        # ------------------- 缓存新的 KV, 并且 Gather 总的 KV 用于 Attention 计算 -------------------
+        # 高性能实现中不需要 Gather KV 后再计算, 而是在 Attention Kernel 中读取 Block Table
+
+        # 本次 Prefill/Decode 产生的每个新 token 的 K/V, 应该写入 Paged KV Cache 的哪个物理位置
         if slot_mapping is None:
             slot_mapping = kv_cache.build_slot_mapping(
                 block_tables=block_tables,
@@ -546,6 +552,9 @@ class BasePagedAttention(torch.nn.Module, ABC):
         kv_cache.write(key, value, slot_mapping)
         updated_seq_lens = seq_lens + query_lens.to(seq_lens.dtype)
         full_key, full_value, valid_keys = kv_cache.gather(block_tables, updated_seq_lens)
+
+        # ------------------- 
+
         output, valid_queries = self._compute_attention(
             q=q,
             key=full_key,
