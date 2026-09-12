@@ -68,10 +68,17 @@ def flash_attention_forward(
             key_positions = torch.arange(
                 kv_start, kv_end, device=q.device
             )
-            blocked = ( # [1, 1, M, N]
-                key_positions[None, None, None, :]
-                > query_positions[None, None, :, None]
-            )
+            if causal:
+                blocked = ( # [1, 1, M, N]
+                    key_positions[None, None, None, :]
+                    > query_positions[None, None, :, None]
+                )
+            else:
+                blocked = torch.zeros(
+                    (1, 1, current_q_length, kv_end - kv_start),
+                    dtype=torch.bool,
+                    device=q.device,
+                )
             current_valid_keys = key_padding_mask[:, kv_start:kv_end]
             blocked = (
                 blocked | ~current_valid_keys[:, None, None, :]
