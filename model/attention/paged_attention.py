@@ -143,10 +143,10 @@ class PagedKVCache:
 
     def build_slot_mapping(
         self,
-        block_tables: torch.Tensor,
-        start_positions: torch.Tensor,
-        query_length: int,
-        query_lens: torch.Tensor,
+        block_tables: torch.Tensor, # [B, ...], 每个请求一个 Block ID List
+        start_positions: torch.Tensor, # [B] 在新的 token 到来之前已经存在的 Sequence 长度
+        query_length: int, # 当前 Batch 中每条请求带填充之后的序列长度
+        query_lens: torch.Tensor, # 当前 Batch 中每条请求的真实序列长度, 不携带 Pad
     ) -> torch.Tensor:
         """Map each new logical token position to a flat physical cache slot.
 
@@ -534,9 +534,10 @@ class BasePagedAttention(torch.nn.Module, ABC):
             expected_valid = torch.arange(
                 query_length, device=x.device
             )[None, :] < query_lens.to(torch.long)[:, None]
-            if not (slot_mapping[expected_valid] >= 0).all() or not (
-                slot_mapping[~expected_valid] == -1
-            ).all():
+            if (
+                not (slot_mapping[expected_valid] >= 0).all()
+                or not (slot_mapping[~expected_valid] == -1).all()
+            ):
                 raise ValueError(
                     "slot_mapping must be non-negative for valid queries and -1 for padding"
                 )

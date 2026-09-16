@@ -21,7 +21,7 @@ def flash_attention_forward(
 
     # force q shape dimension is 4
     batch_size, n_heads, query_length, head_dim = q.shape
-    _, _, key_value_length, _ = q.shape
+    _, _, key_value_length, _ = k.shape
 
     for q_start in range(0, query_length, block_q):
         q_end = min(q_start + block_q, query_length)
